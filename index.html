@@ -31,7 +31,7 @@ section{background:var(--panel);border:1px solid var(--brd);border-radius:8px;di
 .wtr{margin-left:auto;display:flex;gap:8px;align-items:center}.wtr .wx{margin-left:0}
 .wr,.wm{cursor:pointer;padding:0 3px}.wr:hover,.wm:hover{color:var(--acc)}
 .wopt{display:flex;gap:3px;align-items:center;cursor:default;color:var(--mut)}.wopt input{padding:0;margin:0}
-#chat{padding:4px 8px;font-size:13px;gap:1px}
+#chat,#chk{padding:4px 8px;font-size:13px;gap:1px}#chk .cl{line-height:1.35;word-break:break-word}#chk .ts{color:#4b5262;font-size:11px;margin-right:5px}#chk .bad{color:#ff7b72}#chk .ok{color:#7ee787}
 #chat .cl{line-height:1.35;word-break:break-word}#chat .ts{color:#4b5262;font-size:11px;margin-right:5px}#chat .ch{font-weight:600;margin-right:5px}
 #navb{align-items:center;justify-content:center;padding:6px;overflow:hidden}
 #compass[data-mode=row],#compass[data-mode=col]{display:flex;width:100%;height:100%;flex:1;min-height:0}
@@ -116,7 +116,8 @@ table{border-collapse:collapse;width:100%}td,th{padding:3px 8px;border-bottom:1p
   <label style="font-size:12px;color:var(--mut)" title="незнакомых мобов (нет в базе) осматривать самому и записывать карточку"><input type="checkbox" id="al"> автоосмотр</label>
   <label style="font-size:12px;color:var(--mut)" title="показать загаганные и схлопнутые строки"><input type="checkbox" id="sg"> скрытое</label>
   <div id="opt" style="margin-left:auto;position:relative"><button id="optb">Опции ▾</button>
-    <div id="optm"><button data-w="w-chat">💬 Сообщения</button><button data-w="w-nav">🧭 Движение</button><button data-w="w-mm">Миникарта</button><button data-w="w-room">Комната и моб</button><button data-w="w-map">Карта зоны</button><button data-t="grp">👥 Группа</button><hr><button data-t="mobs">Мобы зоны</button><button data-t="walks">Спидволки</button><button data-t="rn">Заметки к клеткам</button><button data-t="prof">Алиасы и триггеры</button><button data-t="hot">Хоткеи</button><hr><button id="lay">⟲ Окна по умолчанию</button></div></div>
+    <div id="optm"><button data-w="w-chat">💬 Сообщения</button><button data-w="w-chk">✅ Проверки</button><button data-w="w-nav">🧭 Движение</button><button data-w="w-mm">Миникарта</button><button data-w="w-room">Комната и моб</button><button data-w="w-map">Карта зоны</button><button data-t="grp">👥 Группа</button><hr><button data-t="mobs">Мобы зоны</button><button data-t="walks">Спидволки</button><button data-t="rn">Заметки к клеткам</button><button data-t="prof">Алиасы и триггеры</button><button data-t="hot">Хоткеи</button><hr><button id="lay">⟲ Окна по умолчанию</button></div></div>
+  <button id="rst" title="Закрыть клиента, открыть заново с этим же профилем и войти в игру">⟳ Перезапуск</button>
   <button id="btn" title="F12">Подключиться</button>
 </header>
 <main id="desk">
@@ -127,6 +128,7 @@ table{border-collapse:collapse;width:100%}td,th{padding:3px 8px;border-bottom:1p
   <section class="win" id="w-mm"><div class="wt"><span>Миникарта</span><label class="wopt" title="карта, которую игра печатает при «реж карт да», показывается только здесь, а не в окне игры"><input type="checkbox" id="hm" checked> не в игре</label><span class="wx" data-close="w-mm" title="закрыть">✕</span></div><div class="wbody" id="mmb"><div class="mmwrap" id="mmw"><canvas id="mmc" width="260" height="190"></canvas></div></div></section>
   <section class="win" id="w-nav"><div class="wt"><span>Движение</span><span class="wm" id="navm" title="расположение кнопок: крест → в строку → в столбец. В строке и столбце кнопки можно перетаскивать, меняя порядок">▦</span><span class="wx" data-close="w-nav" title="закрыть">✕</span></div><div class="wbody" id="navb"><div id="compass" data-mode="cross"></div></div></section>
   <section class="win" id="w-chat"><div class="wt"><span>Сообщения</span><label class="wopt" title="оставлять сообщения клана, союза и группы и в окне игры"><input type="checkbox" id="chgame"> и в игре</label><span class="wm" id="chclr" title="очистить окно">🗑</span><span class="wx" data-close="w-chat" title="закрыть">✕</span></div><div class="wbody" id="chat"></div></section>
+  <section class="win" id="w-chk"><div class="wt"><span>Проверки</span><span class="wm" id="chkclr" title="очистить окно">🗑</span><span class="wx" data-close="w-chk" title="закрыть">✕</span></div><div class="wbody" id="chk"></div></section>
   <section class="win" id="w-room"><div class="wt"><span>Комната и моб</span><span class="wx" data-close="w-room" title="закрыть">✕</span></div><div class="wbody" id="roomp"><h3 id="rn">—</h3><div class="vn" id="rv"></div><div class="desc short" id="rd" title="нажмите, чтобы развернуть"></div>
         <div id="rl"></div><div id="card"></div></div></section>
     <section class="win" id="w-map"><div class="wt"><span>Карта зоны</span><span class="wx" data-close="w-map" title="закрыть">✕</span></div>
@@ -155,7 +157,7 @@ const out=$('out'),cmd=$('cmd');
 const C=['#555','#d0544a','#3fae5a','#c9a227','#4a7be0','#b065c8','#2aa8b8','#c9ccd3'],B=['#888','#ff6b5e','#6fe08a','#ffe066','#78a6ff','#e08aff','#66e6f2','#ffffff'];
 let fg=null,bold=false;
 const MAXL=20000,live=$('live');
-let GAGS=[],cur_ln=null,lastVis=null,lastPlain=null;
+let GRG=[],GRSHOW=0,GAGS=[],cur_ln=null,lastVis=null,lastPlain=null;
 const PROMPT_ONLY=/^\d+H \d+M \d+V \S+ \d+C Вых:\S*>+\s*$/;
 function hhmmss(){const d=new Date();return d.toTimeString().slice(0,8)}
 function atBottom(){return out.scrollHeight-out.scrollTop-out.clientHeight<40}
@@ -164,7 +166,11 @@ function body(d){return d.textContent.slice(d.firstChild.textContent.length)}
 function span(d,t,cls,col){const s=document.createElement('span');s.textContent=t;if(cls)s.className=cls;if(col)s.style.color=col;d.appendChild(s)}
 function sgr(codes){for(const c of codes.split(';').map(Number)){if(c===0||isNaN(c)){fg=null;bold=false}else if(c===1)bold=true;else if(c===22)bold=false;else if(c>=30&&c<=37)fg=c-30;else if(c===39)fg=null}}
 function col(){return fg===null?(bold?'#fff':null):(bold?B:C)[fg]}
-function gagged(p){for(const r of GAGS)if(r.test(p))return true;return false}
+function ownLine(p){p=p.toLowerCase();return !!GROUP&&GROUP.members.some(m=>{const n=m.name.replace(/^\d+\s+/,'').toLowerCase();return n.length>2&&p.includes(n)})}   // регистр не важен: в таблице «драколич», в комнате «Драколич»
+function gagged(p){if(Date.now()>GRSHOW&&GRG.some(r=>r.test(p)))return true
+for(const r of GAGS)if(r.test(p))return true
+ if(GROUP&&/ (летает|стоит|сидит|отдыхает|спит|лежит|сражается) здесь\./.test(p)&&ownLine(p))return true   // свои из группы; чужие и мобы остаются
+ return false}
 function finish(d){const p=body(d).replace(/\s+$/,'');if(/ R\.I\.P\.$/.test(p)&&$('grpa').checked)setTimeout(grAuto,300);
  const cm=chatParse(p);
  if(cm&&!cm.skip){addChat(cm);if(!$('chgame').checked&&!$('w-chat').classList.contains('hid')){d.classList.add('g');return}}   // сообщение ушло в окно «Сообщения»
@@ -234,15 +240,18 @@ function shortProfile(v){let m=v.match(/^\s*(алиас|триг|триггер)
  if(m){const [_,k,a,b]=m;return (/^алиас/i.test(k)?'#alias':'#action')+' {'+a.trim()+'} {'+b.trim()+'}'}
  m=v.match(/^\s*-(алиас|триг|триггер)\s+(.+)$/i);if(m)return (/^алиас/i.test(m[1])?'#unalias':'#unaction')+' {'+m[2].trim()+'}';return null}
 $('f').onsubmit=e=>{e.preventDefault();const v=cmd.value;
- if(cmd.type==='password'){fetch('/password'+($('pwsv').checked?'?save=1':''),{method:'POST',body:v})}else{if(v){hist.push(v);hp=hist.length}
+ if(cmd.type==='password'){fetch('/password'+($('pwsv').checked?'?save=1':''),{method:'POST',body:v})}else{if(v){hist.push(v);hp=hist.length}if(/^\s*гр(у(п(п(а)?)?)?)?\s*$/i.test(v)){GRSHOW=Date.now()+2500;fetch('/grshow',{method:'POST'})}   // свою команду «группа» показываем в окне игры
   const sp=shortProfile(v);if(sp)send(sp);else if(/^\s*#(alias|action|unalias|unaction|hot|unhot|variable|group)\b/i.test(v))send(v.trim());else v.trim()?sendCmds(v):send('')}cmd.value=''};
 cmd.onkeydown=e=>{if(cmd.type==='password')return;
  if(e.key==='ArrowUp'&&hp>0){cmd.value=hist[--hp];e.preventDefault()}else if(e.key==='ArrowDown'){hp=Math.min(hist.length,hp+1);cmd.value=hist[hp]||'';e.preventDefault()}};
 function setStatus(on){connected=on;$('st').className=on?'on':'off';$('st').textContent=on?'sowmud.ru:5555':'нет связи';$('btn').textContent=on?'Отключиться':'Подключиться'}
+$('rst').onclick=async()=>{if(!confirm('Перезапустить клиент и войти в игру заново?'))return;note('Перезапуск…');
+ await fetch('/api/restart',{method:'POST'}).catch(()=>{});await new Promise(r=>setTimeout(r,3000))
+ for(let i=0;i<60;i++){try{if((await fetch('/api/info')).ok){location.reload();return}}catch(e){}await new Promise(r=>setTimeout(r,500))}}
 $('btn').onclick=()=>fetch(connected?'/disconnect':'/connect',{method:'POST'});
 function put(c){cmd.value=c;cmd.focus()}
-let AC=null;function beep(){try{AC=AC||new AudioContext();[0,.25,.5].forEach(d=>{const o=AC.createOscillator(),g=AC.createGain();o.frequency.value=880;o.connect(g);g.connect(AC.destination);g.gain.value=.15;o.start(AC.currentTime+d);o.stop(AC.currentTime+d+.15)})}catch(e){}}
-function alertMsg(t){beep();const a=$('alert');a.textContent=t;a.style.display='block';clearTimeout(a._t);a._t=setTimeout(()=>a.style.display='none',8000)}
+function checkMsg(d){const a=$('alert');let n=60;clearInterval(a._c);clearTimeout(a._t);const f=()=>{a.textContent='ПРОВЕРКА ПРИСУТСТВИЯ! Ответь: молиться я здесь — '+n+' с  ['+d.join(' / ').slice(0,160)+']';a.style.display='block';};f();a.onclick=()=>{clearInterval(a._c);a.style.display='none'};a._c=setInterval(()=>{if(--n<=0){clearInterval(a._c);a.style.display='none'}else f()},1000)}
+function alertMsg(t){const a=$('alert');a.textContent=t;a.style.display='block';clearTimeout(a._t);a._t=setTimeout(()=>a.style.display='none',8000)}
 
 // ================= статус =================
 function status(s){LAST_ST=s;[['hp','hp','hpm'],['mp','mp','mpm'],['mv','mv','mvm']].forEach(([id,a,b])=>{if(s[a]==null)return;$(id).style.width=Math.min(100,100*s[a]/(s[b]||s[a]||1))+'%';$(id+'v').textContent=s[a]+'/'+(s[b]||'?')});
@@ -300,11 +309,15 @@ function compass(ex){lastEx=ex;let have=new Set();if(typeof ex==='string'){for(c
   b.ondrop=e=>{e.preventDefault();const from=e.dataTransfer.getData('text/plain');if(!from||from===d)return;const o=ord.filter(x=>x!==from);o.splice(o.indexOf(d)+(ord.indexOf(from)<ord.indexOf(d)?1:0),0,from);LAY.navord=o;saveLayout();compass(lastEx)};
   c.appendChild(b)})}
 function word(line){const w=line.replace(/[«»"(),.!]/g,'').split(/\s+/).filter(x=>x.length>2);return (w[1]&&/^[А-ЯЁ]/.test(w[0])===false?w[0]:w[0]||'').toLowerCase().slice(0,7)}
+function relabel(r){const m=new Map(r.mobs.filter(x=>x[2]).map(x=>[x[0].trim(),x[2]]));if(!m.size)return;   // в окне игры: строка моба -> «Имя · Проф · ур.» (оригинал в подсказке)
+ let n=0;for(let e=out.lastElementChild;e&&n<150;e=e.previousElementSibling,n++){if(e.className!=='ln'||e.childElementCount<2)continue;
+  const rp=e.querySelector('.rep'),bt=body(e),k=e.dataset.orig||(rp?bt.slice(0,bt.length-rp.textContent.length):bt).trim(),lb=m.get(k);if(!lb)continue;   // «×2» (повтор строки) — не часть текста
+  [...e.children].slice(2).forEach(c=>{if(c!==rp)c.remove()});e.dataset.orig=k;e.title=k;e.children[1].textContent=lb}}
 function room(r){$('rn').textContent=r.name;$('rd').textContent=r.desc;const L=$('rl');L.innerHTML='';
  r.items.forEach(([t])=>{const d=document.createElement('div');d.className='li';d.innerHTML='<span class="it"></span>';d.firstChild.textContent='▪ '+t;L.appendChild(d)});
- r.mobs.forEach(([t,c])=>{const d=document.createElement('div');d.className='li';d.innerHTML='<span class="mb"></span><button title="осмотреть (в строку ввода)">осм</button><button title="убить (в строку ввода)">убить</button>';
-  d.firstChild.textContent='● '+t;if(c)d.firstChild.style.color=ccol(c);const w=word(t);d.children[1].onclick=()=>put('смотреть '+w);d.children[2].onclick=()=>put('убить '+w);L.appendChild(d)});
- if(!cur)compass(r.exits.split(' ').map(x=>({N:'С',S:'Ю',W:'З',E:'В',U:'^',D:'v'})[x]||'').join(''))}
+ r.mobs.forEach(([t,c,lb])=>{if(!lb&&/ (летает|стоит|сидит|отдыхает|спит|лежит|сражается) здесь\./.test(t)&&ownLine(t))return;const d=document.createElement('div');d.className='li';d.innerHTML='<span class="mb"></span><button title="осмотреть (в строку ввода)">осм</button><button title="убить (в строку ввода)">убить</button>';
+  d.firstChild.textContent='● '+(lb||t);if(lb)d.firstChild.title=t;if(c)d.firstChild.style.color=ccol(c);const w=word(t);d.children[1].onclick=()=>put('смотреть '+w);d.children[2].onclick=()=>put('убить '+w);L.appendChild(d)});
+ relabel(r);if(!cur)compass(r.exits.split(' ').map(x=>({N:'С',S:'Ю',W:'З',E:'В',U:'^',D:'v'})[x]||'').join(''))}
 $('rd').onclick=()=>$('rd').classList.toggle('short');
 function bar(v,col){if(!v)return'';return '<div class="mini"><span style="width:44px">'+v[0]+'/'+v[1]+'</span><div class="track"><div class="fill" style="width:'+Math.min(100,100*v[0]/v[1])+'%;background:'+col+'"></div></div></div>'}
 function card(c){const e=$('card');e.style.display='block';const esc=s=>String(s).replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'})[m]);
@@ -404,7 +417,7 @@ let GROUP=null,OTHER={};
 const GCOL={H:'var(--bad)','М':'var(--acc)',M:'var(--acc)',V:'var(--ok)'};
 function drawGroup(){const b=$('grpb');b.innerHTML='';if(!GROUP||!GROUP.members.length){b.innerHTML='<div style="color:var(--mut)">Нет данных — нажмите «гр».</div>';return}
  $('grpt').textContent=' · '+GROUP.t;
- GROUP.members.forEach(m=>{const d=document.createElement('div');d.className='gm';const nm=document.createElement('b');nm.textContent=m.name;d.appendChild(nm);
+ GROUP.members.forEach(m=>{const d=document.createElement('div');d.className='gm';const nm=document.createElement('b');nm.textContent=m.name;if(m.ld){const st=document.createElement('span');st.textContent='* ';st.style.color='#e5484d';st.title='обрыв связи (ЛД)';nm.prepend(st)}d.appendChild(nm);
   ['H','М','V'].forEach(k=>{const v=m.cols[k]??m.cols[k==='М'?'M':k];const g=document.createElement('div');g.className='g5';g.title=k+': '+(v??'?')+'/5';g.innerHTML='<i></i>';g.firstChild.style.cssText='width:'+((v||0)*20)+'%;background:'+GCOL[k];d.appendChild(g)});
   const ex=document.createElement('span');ex.className='ex';const o=OTHER[m.name];ex.textContent=o&&o.hp!=null?o.hp+'/'+o.hpm+'H':(m.cols['Позиция']||'');d.appendChild(ex);
   const fl=document.createElement('div');fl.className='fl';
@@ -415,11 +428,11 @@ function drawGroup(){const b=$('grpb');b.innerHTML='';if(!GROUP||!GROUP.members.
 $('grpr').onclick=()=>send('гр');
 // автообновление группы: раз в раунд (2,5 с) и сразу после «R.I.P.»; вывод и эхо «гр» скрыты (галочка «скрытое» покажет)
 let GR_AUTO=0,GR_LAST=0;
-function grAuto(){if(!connected||Date.now()-GR_LAST<1200)return;GR_LAST=Date.now();GR_AUTO++;send('гр')}
+function grAuto(){if(!connected||Date.now()<GRSHOW||Date.now()-GR_LAST<1200)return;GR_LAST=Date.now();GR_AUTO++;send('гр')}
 try{const v=localStorage.getItem('grauto_'+location.port);$('grpa').checked=v===null?location.port==='8765':v==='1'}catch(e){}
 $('grpa').onchange=e=>{try{localStorage.setItem('grauto_'+location.port,e.target.checked?'1':'0')}catch(x){}};
 setInterval(()=>{if($('grpa').checked)grAuto()},2500);
-GAGS.push(/^\s+Имя\s+H\s+М\s+V\s/,/^\s+Имя\s+(H\s+)?Позиция\s+Рядом/,/^-{30,}\s*$/,/^\s{1,3}\S.*\s(Стоит|Сражается|Сидит|Отдыхает|Спит|Лежит|Оглушен\S*|Без сознания)\s+[ДН]\s/);
+GRG.push(/^\s+Имя\s+H\s+М\s+V\s/,/^\s+Имя\s+(H\s+)?Позиция\s+Рядом/,/^-{30,}\s*$/,/^\s{0,3}\S.*\s(Стоит|Сражается|Сидит|Отдыхает|Спит|Лежит|Оглушен\S*|Без сознания)\s+[ДН]\s/);   // таблица группы — только в окно группы, кроме ручной команды «группа»
 // точные хп своих персонажей из соседних окон клиента
 setInterval(async()=>{for(const p of [8765,8766,8767,8768,8769,8770]){if(String(p)===location.port)continue;try{const s=await (await fetch('http://localhost:'+p+'/api/state')).json();if(s.name&&s.st)OTHER[s.name]=s.st}catch(e){}}
  OTHER[document.title.split(' — ')[0]]=LAST_ST;if(GROUP)drawGroup()},5000);
@@ -501,8 +514,8 @@ addEventListener('keydown',e=>{if(!hotOn||e.metaKey||e.key==='F5'||cmd.type==='p
 
 // ================= окна: свободные; размер и положение хранятся долями рабочего поля и масштабируются вместе с окном приложения =================
 // тащить — за заголовок; менять размер — за любой край и угол; ⟳ — повернуть (поменять ширину и высоту); ✕ — закрыть (вернуть — в «Опции»)
-const WINS=['w-con','w-mm','w-nav','w-room','w-map','w-chat','w-grp','w-tabs'],LKEY='free_v1_'+location.port;let layOn=false;
-const DEFLAY={pos:{'w-con':[0,0,.46,1],'w-mm':[.465,0,.19,.32],'w-nav':[.655,0,.13,.32],'w-room':[.785,0,.215,.32],'w-map':[.465,.325,.535,.34],'w-chat':[.465,.67,.30,.33],'w-grp':[.77,.67,.23,.33],'w-tabs':[.55,.3,.42,.55]},hid:{'w-tabs':1},nav:'cross',navord:null};
+const WINS=['w-con','w-mm','w-nav','w-room','w-map','w-chat','w-grp','w-tabs','w-chk'],LKEY='free_v1_'+location.port;let layOn=false;
+const DEFLAY={pos:{'w-con':[0,0,.46,1],'w-mm':[.465,0,.19,.32],'w-nav':[.655,0,.13,.32],'w-room':[.785,0,.215,.32],'w-map':[.465,.325,.535,.34],'w-chat':[.465,.67,.30,.33],'w-grp':[.77,.67,.23,.33],'w-tabs':[.55,.3,.42,.55],'w-chk':[.465,.67,.30,.33]},hid:{'w-tabs':1,'w-chk':1},nav:'cross',navord:null};
 let LAY=JSON.parse(JSON.stringify(DEFLAY));
 try{const s=JSON.parse(localStorage.getItem(LKEY));if(s&&s.pos){LAY=Object.assign(LAY,s);LAY.pos=Object.assign({},DEFLAY.pos,s.pos);LAY.hid=Object.assign({},DEFLAY.hid,s.hid)}}catch(e){}
 const MINW=150,MINH=80;
@@ -549,15 +562,23 @@ $('navm').onclick=()=>{LAY.nav=LAY.nav==='cross'?'row':LAY.nav==='row'?'col':'cr
 // сообщения клана, союза, группы
 const PRE=/^\d+H \d+M \d+V \S+ \d+C (?:\[[^\]:]+:[^\]]+\] \[[^\]:]+:[^\]]+\] )?Вых:\S*?>+ ?/;
 const CHN={'группе':'Группа','клану':'Клан','союзу':'Союз','союзникам':'Союз'},CHC={'Клан':'#e5a24c','Союз':'#6aa3ff','Группа':'#4cc38a'};
+// Хизмедар (главный иммплементор) пишет лично, в союз, клан, общий канал: «Хизмедар сказал вам: …», «[ Союзники]: Хизмедар: …»
+const HIZ=/^(?:\[[^\]]*\]:?\s*)?Хизмедар(?::| (?:сказал|говор|шепн|крикн|заор|проор|ответ|болта|прокрич|вопрос|сообщ|объяв|пишет|написал)\S*)/i;
+CHC['Хизмедар']='#ff5c5c';
 function chatParse(raw){const p=raw.replace(PRE,'').trim();let m,ch,text,b;
+ if(HIZ.test(p))return {ch:'Хизмедар',text:p,hiz:1};
  if((m=p.match(/^\[\s*(Клан\S*|Союз\S*|Группа)\s*\]:\s*(.*)$/i))){ch=/^к/i.test(m[1])?'Клан':/^с/i.test(m[1])?'Союз':'Группа';text=m[2];b=text.replace(/^[^\s:]+:\s*/,'')}
  else if((m=p.match(/^(\S+) сказал[аио]? (группе|клану|союзу|союзникам): ?"(.*)"$/))){ch=CHN[m[2]];text=m[1]+': '+m[3];b=m[3]}
  else if((m=p.match(/^Вы сказали (группе|клану|союзу|союзникам): ?"(.*)"$/))){ch=CHN[m[1]];text='Вы: '+m[2];b=m[2]}
  else return null;
  return {ch,text,skip:ch==='Группа'&&b.trim().startsWith('!')}}     // «!команда» в группе — не сообщение, в окно не идёт
-function addChat(c){const box=$('chat'),stick=box.scrollHeight-box.scrollTop-box.clientHeight<40,d=document.createElement('div');d.className='cl';
+function addChat(c){if(c.hiz)fetch('/api/hiz').catch(()=>{});const box=$('chat'),stick=box.scrollHeight-box.scrollTop-box.clientHeight<40,d=document.createElement('div');d.className='cl';
  const t=document.createElement('span'),h=document.createElement('span'),x=document.createElement('span');t.className='ts';t.textContent=hhmmss();h.className='ch';h.textContent='['+c.ch+']';h.style.color=CHC[c.ch];x.textContent=c.text;
  d.append(t,h,x);box.appendChild(d);while(box.childElementCount>2000)box.removeChild(box.firstChild);if(stick)box.scrollTop=box.scrollHeight}
+function addChk(t){const e=$('w-chk');if(e.classList.contains('hid'))showWin('w-chk');const box=$('chk'),stick=box.scrollHeight-box.scrollTop-box.clientHeight<40,d=document.createElement('div');d.className='cl';
+ const ts=document.createElement('span'),x=document.createElement('span');ts.className='ts';ts.textContent=hhmmss();x.textContent=t;x.className=/^(НЕТ|ЛИШНЕЕ|НОВОЕ|НАДЕТО|сбой|-сет не выполнен|ИТОГ: проблем)|^\S+: (НЕТ|ЛИШНЕЕ|НАДЕТО|нет сохранённой)|МАЛО|не прочитан/.test(t)?'bad':/совпала|всё в порядке/.test(t)?'ok':'';
+ d.append(ts,x);box.appendChild(d);while(box.childElementCount>2000)box.removeChild(box.firstChild);if(stick)box.scrollTop=box.scrollHeight}
+$('chkclr').onclick=()=>{$('chk').innerHTML=''};
 $('chclr').onclick=()=>{$('chat').innerHTML=''};
 try{$('chgame').checked=localStorage.getItem('chgame')==='1';$('hm').checked=localStorage.getItem('hidemap')!=='0'}catch(e){}
 $('chgame').onchange=e=>{try{localStorage.setItem('chgame',e.target.checked?'1':'0')}catch(x){}};
@@ -569,10 +590,10 @@ applyLayout();
 // ================= поток событий =================
 const es=new EventSource('/events');
 es.onmessage=async ev=>{const m=JSON.parse(ev.data),d=m.d;
- if(m.t==='text')ansi(d);else if(m.t==='echo'){if(d==='гр'&&GR_AUTO>0){GR_AUTO--}else{note(d,'echo');if(/^(пгр позиц ряд холд|гр|инв|обл|сч)$/.test(d)&&lastVis)lastVis.classList.add('g')}}else if(m.t==='sys')note(d,'sys');else if(m.t==='status')setStatus(d==='on');
+ if(m.t==='text')ansi(d);else if(m.t==='echo'){if(d==='гр'&&GR_AUTO>0){GR_AUTO--}else{note(d,'echo');if(/^(пгр позиц ряд холд|гр|инв|обл|сч)$/.test(d)&&lastVis&&Date.now()>GRSHOW)lastVis.classList.add('g')}}else if(m.t==='sys'){if(d.startsWith('ЧЕК: '))addChk(d.slice(5));else note(d,'sys')}else if(m.t==='status')setStatus(d==='on');
  else if(m.t==='password'){cmd.type=d?'password':'text';cmd.classList.toggle('pw',d);cmd.placeholder=d?'пароль':'команда (; — несколько, ↑↓ — история)';cmd.focus()}
  else if(m.t==='st')status(d);else if(m.t==='room')room(d);else if(m.t==='card')card(d);else if(m.t==='minimap')drawMini(d);
- else if(m.t==='mobs'){MAPMOBS=d;draw()}else if(m.t==='pos')pos(d);else if(m.t==='alert')alertMsg(d);else if(m.t==='autolook')$('al').checked=d;else if(m.t==='group'){GROUP=d;drawGroup()}else if(m.t==='profile'){loadProf()}else if(m.t==='trigs'){if(PROF)PROF.enabled=d;if(tab==='prof')render()}
+ else if(m.t==='mobs'){MAPMOBS=d;draw()}else if(m.t==='pos')pos(d);else if(m.t==='alert')alertMsg(d);else if(m.t==='check')checkMsg(d);else if(m.t==='autolook')$('al').checked=d;else if(m.t==='group'){GROUP=d;drawGroup()}else if(m.t==='profile'){loadProf()}else if(m.t==='trigs'){if(PROF)PROF.enabled=d;if(tab==='prof')render()}
  else if(m.t==='rooms'){clearTimeout(window._rt);window._rt=setTimeout(async()=>{if(Z&&cur&&Z.zone===cur.area){const keep=[ox,oy,sc,AL];await loadZone(Z.zone);[ox,oy,sc,AL]=keep;draw()}},1500)}
  else if(m.t==='init'){setStatus(d.status==='on');if(d.group){GROUP=d.group;drawGroup()}if(d.st&&d.st.hp!=null)status(d.st);if(d.room)room(d.room);if(d.card)card(d.card);if(d.minimap)drawMini(d.minimap);MAPMOBS=d.mobs||{};if(d.cur)pos({...d.cur,trail:d.trail})}};
 // после F5 страница не знает, что идёт запрос пароля — спросить у сервера и включить поле пароля

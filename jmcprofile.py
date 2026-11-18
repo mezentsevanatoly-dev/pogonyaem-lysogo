@@ -116,10 +116,34 @@ class Profile:
             f.write("\n".join(self.lines) + "\n")
         self.parse()
 
+    def shared_path(self):
+        """Общие триггеры группы «фк» — один файл рядом с профилями, у всех персонажей одни и те же."""
+        return os.path.join(os.path.dirname(self.path), "фк.txt")
+
+    def save_shared(self, j, line):
+        """j — номер строки в фк.txt (-1 — добавить); пустая line — удалить."""
+        if j < 0:
+            self.shared.append(line.strip())
+        elif j < len(self.shared):
+            if line.strip():
+                self.shared[j] = line.strip()
+            else:
+                del self.shared[j]
+        with open(self.shared_path(), "w", encoding="utf-8") as f:
+            f.write("\n".join(self.shared) + "\n")
+        self.parse()
+
     def parse(self):
         self.aliases, self.actions, self.hots, self.disabled = {}, [], {}, set()
-        for i, ln in enumerate(self.lines):
+        try:
+            self.shared = [x.rstrip() for x in open(self.shared_path(), encoding="utf-8").read().splitlines() if x.strip()]
+        except OSError:
+            self.shared = []
+        # строки фк.txt идут после строк профиля; их номер i = -2 - j (отрицательный: «лежит в общем файле»)
+        for i, ln in list(enumerate(self.lines)) + [(-2 - j, x) for j, x in enumerate(self.shared)]:
             s = ln.strip()
+            if i <= -2 and not s.startswith("#action"):
+                continue
             if s.startswith("#group disable "):
                 self.disabled.add(s.split()[2])
                 continue
@@ -166,7 +190,20 @@ class Profile:
             else:
                 new = "#action TEXT {%s} {%s} {%s} {%s}" % (key, body, rest[2] if len(rest) > 2 else "5", rest[3] if len(rest) > 3 else "claude")
                 old = next((t for t in self.actions if t["pattern"] == key), None)
-            self.save_line(old["i"] if old else -1, new)
+            if k == "#action":                    # группа «фк» — в общий файл фк.txt (для всех персонажей), остальное — в профиль
+                to_shared = (rest[3] if len(rest) > 3 else "") == "фк"
+                if old and old["i"] <= -2:
+                    self.save_shared(-2 - old["i"], new if to_shared else "")
+                    if not to_shared:
+                        self.save_line(-1, new)
+                elif to_shared:
+                    if old:
+                        self.save_line(old["i"], "")
+                    self.save_shared(-1, new)
+                else:
+                    self.save_line(old["i"] if old else -1, new)
+            else:
+                self.save_line(old["i"] if old else -1, new)
             return ("заменён: " if old else "добавлен: ") + new
         if k in ("#unalias", "#unaction", "#unhot") and len(a) >= 2:
             key = a[1]
@@ -174,7 +211,10 @@ class Profile:
                    else next((t for t in self.actions if t["pattern"] == key), None))
             if not old:
                 return "не нашёл: " + key
-            self.save_line(old["i"], "")
+            if old["i"] <= -2:
+                self.save_shared(-2 - old["i"], "")
+            else:
+                self.save_line(old["i"], "")
             return "удалён: " + key
         if k in ("#variable", "#group") and len(a) >= 2:
             self.save_line(-1, line)
@@ -246,7 +286,11 @@ class Profile:
                     aa[n] = w
                 out += self.expand(self.subst(al["body"], aa), None, depth + 1, notes)
             else:
-                out.append(self.subst(c, args))
+                r = self.subst(c, args)
+                if args and r != c and not r.startswith("#"):     # «!фраг» -> «фраг»: подставленное из текста игры тоже может быть алиасом
+                    out += self.expand(r, None, depth + 1, notes)
+                else:
+                    out.append(r)
         return out
 
     def triggers(self, plain):

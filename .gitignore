@@ -17,6 +17,7 @@
 /data/*
 !/data/game.db
 !/data/известные_строки.txt
+!/data/presence_words.txt
 !/data/ЗОНЫ/
 /data/ЗОНЫ/*
 !/data/ЗОНЫ/дт_выходы.txt
