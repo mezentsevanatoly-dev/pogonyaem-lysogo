@@ -45,6 +45,16 @@ except OSError:
     VERSION = "dev"
 LOG = os.path.join(HERE, "game.log")
 
+# Автоснятие аффектов (24.11.2026): если в группе есть паладин Олирон — он снимает всё сам
+# (слово света, молч, холд, прокл, яд…), клиент снимает только УД и забвение.
+# Олирона нет — снимаем всё. False — выключить автоснятие совсем.
+AFF_TRIGGERS = False
+# Проверка стафа ГРУППЫ (осмотр других игроков, «Запускаю проверку стафа», сверка перед -сет) выключена (24.11.2026):
+# сделана криво. Свои чс/чколб/+сет/-сет работают как раньше. True — вернуть.
+CHEK_GROUP = False
+AFF_ALWAYS = ("укр", "забв")          # это паладин не снимает — снимаем всегда
+PALADIN = "олирон"
+
 IAC, DONT, DO, WONT, WILL, SB, SE, GA = 255, 254, 253, 252, 251, 250, 240, 249
 MSDP = 69
 M_VAR, M_VAL, T_OPEN, T_CLOSE, A_OPEN, A_CLOSE = 1, 2, 3, 4, 5, 6
@@ -434,8 +444,28 @@ def gag_list():
 
 # ======================= известные мобы (для автоосмотра) =======================
 CARDS_CSV = os.path.join(HERE, "карточки_мобов.csv")
+BOT_DIR = r"C:\Users\User\Desktop\Клод мад\ТОЛСТЫЙ\areas"      # маршруты Зорона (JMC-бот ТОЛСТЫЙ); Амон проверен им
+BOT_ROUTES = {"амон": {"file": "рр5_АмонСул.botp", "start": "506022", "create": "гг !обл созд север +1",
+                       "pre": "", "step": 47, "rest_at": ("504035",),
+                       "zone_name": "Башня Амон Сул"},   # 504035 — лестница на 3-й этаж, перед ластом
+              "пустоши": {"file": "рр5_Пустоши.botp", "start": "506018", "create": "гг !обл созд север +1",
+                          "pre": "реж !бот да", "step": 95}}
+ZONE_AREAS = {"Башня Амон Сул", "Пустоши троллей", "Окрестности Мории", "Мория", "Лихолесье", "Лысая гора"}
+BOT_WALK = {"амон": "2ws3w5n2ws2wsw2sws5wn6wn3w2n5ws7ws3ws2ws3ws2w3nen",
+            "пустоши": "2ws3w5n2ws2wsw2sws5wn3w2nw2ne4nw2ne2n2w"}   # от портала Ривенделла 500001 → 506022 / 506018
+WALK_RE = re.compile(r"^(?:\d*[nsewud])+$")
+DIR_RU = {"n": "север", "s": "юг", "e": "восток", "w": "запад", "u": "вверх", "d": "вниз"}
+
+
+def expand_walk(s):
+    """«2ws3w» -> [север, север, запад, юг, запад, запад, запад] (как спидволки в окне)."""
+    out = []
+    for n, d in re.findall(r"(\d*)([nsewud])", (s or "").lower()):
+        out += [DIR_RU[d]] * int(n or 1)
+    return out
 CARDS_HEAD = "дата;зона;клетка;строка в комнате;имя;уровень;класс;особенности;хиты;мана;навыки;раса;описание\n"
 _known = set()
+_known_loaded = []
 _known_lock = threading.Lock()
 
 
@@ -446,9 +476,30 @@ def norm_line(s):
     return s.strip().rstrip(".").lower().replace("ё", "е")
 
 
+# «<в правой руке> копье древней династии <> [великолепное] ...светится» — состояние вещи в квадратных скобках
+EQUIP_COND = re.compile(r"^\s*<([^>]+)>\s+(.+?)\s*\[([^\]]+)\]\s*(?:\.\.\..*)?$")
+
+
+def equip_items(lines):
+    """[(слот, вещь, состояние)] из строк «экип»: состояние в [..], метки (<> * ** #) в название не берём."""
+    out = []
+    for ln in lines:
+        m = EQUIP_COND.match(ln)
+        if not m:
+            continue
+        name = m.group(2).strip()
+        while True:
+            n2 = re.sub(r"\s*(?:<>|\*{1,2}|#)\s*$", "", name).strip()
+            if n2 == name:
+                break
+            name = n2
+        out.append((m.group(1).strip(), name, m.group(3).strip()))
+    return out
+
+
 def known_lines():
     with _known_lock:
-        if _known:
+        if _known_loaded:
             return _known
         k = set()
         try:
@@ -463,12 +514,61 @@ def known_lines():
         if os.path.exists(KNOWN_TXT):
             k.update(x for x in open(KNOWN_TXT, encoding="utf-8").read().splitlines() if x)
         if os.path.exists(CARDS_CSV):
-            for ln in open(CARDS_CSV, encoding="utf-8").read().splitlines()[1:]:
+            for ln in open(CARDS_CSV, encoding="utf-8", errors="replace").read().splitlines()[1:]:
                 p = ln.split(";")
                 if len(p) > 3:
                     k.add(norm_line(p[3]))
         _known.update(k)
+        _known_loaded.append(1)                    # не по «_known не пуст»: save_card может добавить строку раньше первой загрузки
         return _known
+
+
+_mob_names = set()
+_mob_names_lock = threading.Lock()
+
+
+def mob_names():
+    """Имена из карточек мобов (в CSV и game.db): по ним отличаем моба от игрока/питомца при входе в комнату."""
+    with _mob_names_lock:
+        if not _mob_names:
+            try:
+                c = db()
+                for (n,) in c.execute("select distinct name from mob_cards"):
+                    if n:
+                        _mob_names.add(norm_line(n))
+                c.close()
+            except Exception:
+                pass
+            try:
+                for ln in open(CARDS_CSV, encoding="utf-8", errors="replace").read().splitlines()[1:]:
+                    p = ln.split(";")
+                    if len(p) > 4 and p[4].strip():
+                        _mob_names.add(norm_line(p[4]))
+            except OSError:
+                pass
+        return _mob_names
+
+
+_csv_zone = {"mt": 0.0, "by_zone": {}}
+
+
+def csv_zone_lines():
+    """Строки мобов по зонам из карточки_мобов.csv (кэш по времени файла): подпись в комнате берётся и оттуда."""
+    try:
+        mt = os.path.getmtime(CARDS_CSV)
+    except OSError:
+        return {}
+    if _csv_zone["mt"] != mt:
+        by_zone = {}
+        try:
+            for ln in open(CARDS_CSV, encoding="utf-8", errors="replace").read().splitlines()[1:]:
+                p = ln.split(";")
+                if len(p) > 3 and p[1].strip() and p[3].strip():
+                    by_zone.setdefault(p[1].strip().lower(), set()).add(norm_line(p[3]))
+        except OSError:
+            return {}
+        _csv_zone["mt"], _csv_zone["by_zone"] = mt, by_zone
+    return _csv_zone["by_zone"]
 
 
 # после списка комнаты до строки состояния идут чужие события (чат, бой, приходы-уходы): это уже не содержимое комнаты
@@ -476,6 +576,9 @@ ROOM_END = re.compile(r"Вы |\S+ (?:сказал\S*|говорит|крикну
                       r"|.* (?:вступил\S* в бой|произнес\S* магические слова|(?:прилетел|пришел|улетел|ушел|убежал)\S* (?:с|на) "
                       r"|прекратил\S* следовать|начал\S* следовать|передал\S* .*лидерство)")
 FIGHT = re.compile(r"^(.+?) (?:стоит|стоят|сидит|сидят|летает|летают|лежит|лежат|отдыхает|отдыхают|спит|спят) здесь, сража\S+ с ")
+# моб вошёл в комнату: «Артиллерист I группы пришел с запада.», «Пещерные жуки приползли с востока.»,
+# «Эльф путешественник прибрел с севера.» — глаголы любые на «при…», лишь бы с направлением
+ARRIVE = re.compile(r"^(.+?) (при[а-яё]+) (?:с|из|от) [а-яё]+\.$")
 
 
 def mob_label(line):
@@ -493,7 +596,7 @@ def mob_label(line):
                 return f'{r["name"]} · {r["prof"] or "?"} · ур.{r["level"]}'
         c.close()
         if os.path.exists(CARDS_CSV):
-            rows = [ln.split(";") for ln in open(CARDS_CSV, encoding="utf-8").read().splitlines()[1:]]
+            rows = [ln.split(";") for ln in open(CARDS_CSV, encoding="utf-8", errors="replace").read().splitlines()[1:]]
             rows = [p for p in rows if len(p) > 6]
             for p in rows:
                 if norm_line(p[3]) == key:
@@ -516,6 +619,35 @@ def mob_label(line):
     return None
 
 
+def card_room_line(ls):
+    """Строка моба из текста карточки, если осмотр был ручной и номер не назван: «… стоит здесь» и т.п."""
+    for s in ls:
+        t = s.strip()
+        if re.search(r"\s(?:стоит|сидит|летает|лежит|бредет|отдыхает|спит|сражается)\b.*(?:здесь|тут)", t) \
+                and not t.startswith(("Вы видите", "Квест", "Аффекты", "Навыки", "Хиты")):
+            return t
+    return None
+
+
+def mob_card_db(card, line, cur):
+    """Карточка ещё и в game.db (mob_cards) — чтобы её сразу видели «Мобы зоны» и подписи в комнате."""
+    try:
+        zone = (cur or {}).get("area") or ""
+        hp = "/".join(map(str, card["hp"])) if card["hp"] else ""
+        mp = "/".join(map(str, card["mana"])) if card["mana"] else ""
+        kind = "мирный" if any("мирн" in f.lower() for f in card.get("flags") or []) else "моб"
+        c = db()
+        c.execute("delete from mob_cards where zone=? and name=?", (zone, card["name"]))
+        c.execute("insert into mob_cards (zone,name,level,prof,hp,mana,skills,kind,desc,room) values (?,?,?,?,?,?,?,?,?,?)",
+                  (zone, card["name"], card["level"], card["cls"], hp, mp, card["skills"], kind, card["desc"], line))
+        c.commit()
+        c.close()
+        with _mob_names_lock:                       # новую карточку сразу знаем при входе в комнату
+            _mob_names.add(norm_line(card["name"]))
+    except Exception as e:
+        print("card db:", e)
+
+
 def save_card(card, line, cur):
     new = not os.path.exists(CARDS_CSV)
     clean = lambda x: str(x).replace(";", ",").replace("\n", " ")
@@ -530,6 +662,7 @@ def save_card(card, line, cur):
         f.write(";".join(clean(x) for x in row) + "\n")
     with _known_lock:
         _known.add(norm_line(line))
+    mob_card_db(card, line, cur)
 
 
 # ======================= миникарта =======================
@@ -638,7 +771,7 @@ PRESENCE_LOG = os.path.join(HERE, "presence_calib.log")
 PRESENCE_DUMP = os.path.join(HERE, "presence_dump.log")      # разбор: последние строки перед ответом на проверку / тревогой
 PRESENCE_SHADOW = os.path.join(HERE, "presence_shadow.log")   # тень: серии строк без словаря, одна строка на серию
 PRESENCE_SEEN = os.path.join(HERE, "presence_seen.txt")      # строки, которые уже встречались: проверка каждый раз новая, обычный текст повторяется
-AUTO_MOL = os.environ.get("PRESENCE_AUTO_MOL", "1") != "0"   # автонажатие «мол тут» на автопроверке; 0 — выключить
+AUTO_MOL = True    # автопроверка всегда включена: «мол тут» на автопроверке, без выключателя
 
 
 class Presence:
@@ -649,7 +782,7 @@ class Presence:
     Цвет в правиле не участвует (только пишется в лог): тревога по 5 строкам за 10 с, цвет не решает.
     Каждая подозрительная строка пишется туда же; по ответу на проверку и по её исходу последние строки
     (включая те, что словарь счёл «своими») выгружаются в presence_dump.log — так видно, что именно пришло."""
-    WINDOW, PER_WINDOW, QUIET = 10.0, 5, 90.0
+    WINDOW, PER_WINDOW, QUIET = 10.0, 5, 50.0
 
     def __init__(self):
         self.words = []
@@ -725,11 +858,11 @@ class Presence:
                     len(own), ",".join(map(str, own)), len(h) - len(own),
                     " ".join(ascii(c)[:40] for c in cols_seen[:6]), " | ".join(x[3][:60] for x in h[:3])))
             if os.path.getsize(PRESENCE_SHADOW) > 100_000:      # лог не растёт: остаются последние 300 серий
-                with open(PRESENCE_SHADOW, encoding="utf-8") as f:
+                with open(PRESENCE_SHADOW, encoding="utf-8", errors="replace") as f:
                     tail = f.readlines()[-300:]
                 with open(PRESENCE_SHADOW, "w", encoding="utf-8") as f:
                     f.writelines(tail)
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             pass
 
     def _line(self, clean, cols, now):
@@ -903,7 +1036,8 @@ def popup_main(name, port, lines, auto="0"):
     def top():
         root.attributes("-topmost", True)
         root.after(1000, top)
-    top()
+    if not auto:                                          # автопроверка отвечает сама — поверх всех не лезем
+        top()
     root.after(75000, root.destroy)                       # у проверки на ответ 1 минута
     if auto:                                              # автопроверка: не ждём человека
         root.after(800, mol)
@@ -930,6 +1064,7 @@ class Mud:
         self.room = None                # {name, desc[], exits, items[], mobs[]}
         self.room_stage = None          # None / name / desc / contents
         self.card = None
+        self.look_req = None            # ручной «см …»: (что искали, время, клетка) — по нему пишем карточку
         self.card_lines = None
         self.cur = None                 # {vnum, area, name, exits}
         self.trail = deque(maxlen=60)
@@ -1045,7 +1180,10 @@ class Mud:
                     f.write(plain + "\n")
                     self.lines.append(plain)
             for ln in full:
-                self.parse_line(ln.rstrip("\r"))
+                try:                                    # сбой разбора строки не должен съедать остаток пакета и триггеры
+                    self.parse_line(ln.rstrip("\r"))
+                except Exception:
+                    self.log_trace()
                 plain = ANSI.sub("", ln).rstrip("\r")
                 self.check_bad_pw(plain)
                 p = PROMPT.match(plain)
@@ -1099,12 +1237,18 @@ class Mud:
         m = re.search(r"Пользователь: \[(.+?)\], активный персонаж: \[(.+?)\]", plain)
         if m and m.group(1) and not USER_SAVED.get("v"):
             remember_account(m.group(1))
-        if (self.state == "game" and not self.menu_sent and plain.rstrip().endswith("Ваш выбор:")
+        if (self.state in ("game", "menu") and not self.menu_sent and plain.rstrip().endswith("Ваш выбор:")
                 and "Войти в игру" in "".join(self.lines[-10:])):
             self.menu_sent = True
-            self.send_raw("1")                      # меню аккаунта: 1) Войти в игру (как триггер «Ваш выбор: » -> 1 в профиле)
+            self.state = "menu"                     # меню аккаунта: 1) Войти в игру (как триггер «Ваш выбор: » -> 1 в профиле)
+            self.send_raw("1")
+        # меню персонажа после смерти не выбираем сами: там список, и «Тадия» может оказаться не тем персонажем
 
     def on_prompt(self, p):
+        if self.state == "menu":                        # снова в игре: приглашение пришло
+            self.state = "game"
+            self.menu_sent = True
+            self.emit("sys", "снова в игре")
         hp, mp, mv = int(p["hp"]), int(p["mp"]), int(p["mv"])
         st = dict(self.st)
         st.update(hp=hp, mp=mp, mv=mv, exp=p["exp"], coins=int(p["coins"]), exits=p["exits"],
@@ -1128,6 +1272,37 @@ class Mud:
         if st != self.st:
             self.st = st
             self.emit("st", st)
+        if st.get("hpm") and st["hp"] < 0.40 * st["hpm"] and time.time() >= getattr(self, "bandage_t", 0):
+            self.bandage_t = time.time() + 15
+            self.send_raw("перевязка")                     # Тадия лечится только перевязкой: <40% и если у Зорона кд
+            self.emit("sys", "перевязка: хп %d/%d" % (st["hp"], st["hpm"]))
+        if NAME.lower() == "зорон" and st.get("fight"):      # ярость: клич копьём раз в 10 с боя (не по раундам-приглашениям)
+            if time.time() - getattr(self, "rage_t", 0) >= 10:
+                self.rage_t = time.time()
+                self.send_raw("ярост х")
+        if (NAME.lower() in self.DRUID and (self.cur or {}).get("area") in ZONE_AREAS
+                and time.time() - getattr(self, "look_t", 0) > 2.5):   # каждый раунд смотрим комнату: есть моб — землетрясение
+            self.look_t = time.time()
+            self.send_raw("смотреть")
+        if NAME.lower() == "тадия" and getattr(self, "regen", None) is not None:
+            pass
+        self.cols_setup()                                  # один раз за сессию: столбцы Слеп/Яд/Болезнь в «пгр»
+        self.fight_act()                                   # в бою кастуем/пнём/переключаемся на хилера
+        self.cure_first()                                  # сначала дебаффы (слепота), потом всё остальное
+        self.bandage_check()                               # Зорон подлечивает Тадию перевязкой
+        self.regen_keep()                                  # регенерация на обоих: кд 6 мин, живёт 30+ мин
+        self.staff_check()
+        if not getattr(self, "bot_resumed", False):       # после перезапуска продолжить бота с запомненного шага
+            self.bot_resumed = True
+            st = self.bot_state()
+            if st.get("state") == "running" and st.get("zone") in BOT_ROUTES:
+                steps = self.bot_steps(st["zone"])
+                if steps:
+                    self.bot["steps"] = steps
+                    if not (getattr(self, "bot_thread", None) and self.bot_thread.is_alive()):
+                        self.bot_thread = threading.Thread(target=self.bot_loop, daemon=True)
+                        self.bot_thread.start()
+                        self.bot_say("продолжаю с шага %d после перезапуска" % (st.get("i", 0) + 1))
         if self.state in ("wait_pass", "pass", "game") and not self.msdp_on:
             self.state = "game"
             self.request_msdp()
@@ -1135,8 +1310,218 @@ class Mud:
     def parse_line(self, raw):
         clean, cols = split_colored(raw, self.sgr)
         low = clean.lower()                                # исход проверки: по нему видно, поймали её или нет
+        self.affects_line(clean)
+        if getattr(self, "bot_acts", None):
+            for a in list(self.bot_acts):
+                if time.time() > a["until"]:
+                    self.bot_acts.remove(a)
+                    continue
+                if not a["fired"] and a["rx"].search(clean):
+                    a["fired"] = True
+                    self.bot_acts.remove(a)
+                    self.emit("sys", "бот-триггер: " + clean.strip()[:70])
+                    import jmcprofile as _jp
+                    for c in _jp.split_cmds(a["body"]):
+                        c = c.strip()
+                        if not c:
+                            continue
+                        c = c.replace("$pWeapon", "коса" if NAME.lower() == "тадия" else "контос")
+                        m_rep = re.match(r"#(\d+)\s+(.*)$", c)
+                        if m_rep:
+                            for _ in range(int(m_rep.group(1))):
+                                self.send_alias(m_rep.group(2))
+                        else:
+                            self.send_alias(c)
+        if self.state == "menu":                           # в меню аккаунта игровые строки не разбираем
+            if PROMPT.match(clean):
+                self.state = "game"
+                self.menu_sent = True
+                self.emit("sys", "снова в игре")
+            elif (not self.menu_sent and clean.strip() == "Ваш выбор:"
+                  and "Войти в игру" in "".join(self.lines[-10:])):
+                self.menu_sent = True                      # приглашение меню пришло отдельной строкой
+                self.send_raw("1")
+            return
+        if clean.strip().startswith("Вы мертвы"):          # смерть: игра уходит в меню персонажа — там только выбор пункта
+            self.state = "menu"
+            self.menu_sent = False
+            self.emit("sys", "Вы мертвы — выбираю «1) Войти в игру»")
+            if getattr(self, "bot", {}).get("run"):
+                self.bot_stop()                            # бот после смерти не продолжает с середины маршрута
+                self.bot_say("смерть — остановился на шаге %d" % (self.bot.get("i", 0) + 1))
+            return
+        # групповая команда «!чин все» — каждый чинит своего персонажа (своё эхо «Вы сказали…» тоже считается)
+        mg = re.match(r'^(?:Вы сказали|(.+?) сказал[аи]?) группе: "!(.+?)"\s*$', clean.strip())
+        if mg:
+            who = (mg.group(1) or "").strip()
+            cmd = mg.group(2).strip().lower()
+            if (not who or self.is_ours(who)) and cmd in ("чин все", "чинить все", "чин"):
+                self.group_cmd_t = time.time()
+                self.send_raw("чинить все")
+                self.emit("sys", "группа: чиню себя" + ((" (" + who + ")") if who else ""))
+            return
+        # дошли по «путь ремонт»: игра пишет «Вы достигли пункта назначения.» — кричим группе чиниться
+        if (clean.strip().startswith("Вы достигли пункта назначения")
+                and getattr(self, "repair_wait", 0) and time.time() - self.repair_wait < 120):
+            self.repair_wait = 0
+            self.repair_arrived = self.repair_sent = time.time()
+            self.send_raw("гг !чин все")
+            self.emit("sys", "ремонт: дошли — «гг !чин все»")
+        if "Утраченное мастерство вернулось" in clean:
+            self.oblivion_until = 0
+        if getattr(self, "creating", False) and "должны еще" in clean:
+            self.creating = False                        # +1 пока недоступен — создаём обычную сложность
+            self.emit("sys", "+1 пока нельзя (нужно ещё 8 заданий) — создаю обычную область")
+            self.send_cmd("гг !обл созд север")
+        if "Вы вновь можете использовать умение 'перевязка'" in clean:
+            self.bandage_t = 0                            # кд перевязки кончилось — можно снова при низком хп
+        m_obl = re.match(r"^(.+?) потерял\S* часть своего мастерства", clean.strip())
+        if m_obl and m_obl.group(1).strip().lower() not in ("вы", NAME.lower()):
+            self.afflict(m_obl.group(1).strip(), "забв")
+        if (re.search(r"Вам лучше встать на ноги|Вы упали(?: и больно ударились)?\.|сбил\S* вас с ног", clean)
+                and time.time() >= getattr(self, "stand_t", 0)):
+            self.stand_t = time.time() + 1.5
+            self.send_raw("вст")
+        if self.aff_ok("молч") and (any(w in low for w in ("замерли на месте", "замер на месте", "черное безмолвие", "оковы сознан",
+                                                    "судорог", "запаниковал", "обездвиж", "сков"))
+                             or ("потерял" in low and "разговаривать" in low)) and time.time() >= getattr(self, "or_t", 0):
+            self.or_t = time.time() + 3                  # любой аффект: очистить + освободить разум
+            tgt = ""
+            if "тади" in low:
+                tgt = " тадия"
+            elif "зорон" in low:
+                tgt = " зорон"
+            self.send_raw("очистить")
+            self.send_raw("к осв.разу" + tgt)
+        if "создал экземпляр зоны" in clean or "создан экземпляр зоны" in clean:
+            self.obl_save((getattr(self, "bot", {}) or {}).get("zone", ""))   # помним время: КД 60 мин
+        if "Руны охранного свитка" in clean:              # сработал охранный свиток: унесло, хитов мало
+            self.bandage_t = 0                            # перевязка сразу, без паузы
+            self.emit("sys", "охранный свиток сработал: мало хитов — перевязываюсь")
+        m_blind = re.match(r"^(.+?) ослеп(?:ла|ли)?\s*[!.]", clean.strip())
+        if m_blind:                                       # «Вы ослепли!» и «Зорон ослеп!» — оба
+            who = m_blind.group(1).strip()
+            if who.lower() in ("вы", (NAME or "").lower()):
+                self.blind_self_t = time.time()
+            else:
+                nm = self.member_by_form(who) or who
+                if not hasattr(self, "blind_seen"):
+                    self.blind_seen = {}
+                self.blind_seen[nm] = time.time()
+            if self.aff_ok("слеп"):
+                self.emit("sys", "слепота: " + who[:40] + " — слово света сразу")
+        if "прозрел" in low:                              # сняли — больше не долбим слово света
+            self.blind_self_t = 0
+            for k in list((getattr(self, "blind_seen", {}) or {})):
+                self.blind_seen.pop(k, None)
+        m_curse = re.match(r"^(?:Вы|(.+?)) выгляди\S* несчастн", clean.strip())
+        if m_curse:                                       # проклятие: «Вы выглядите несчастным»
+            who = (m_curse.group(1) or "").strip()
+            nm = NAME if not who or who.lower() in ("вы", (NAME or "").lower()) else (self.member_by_form(who) or "")
+            if nm:
+                self.afflict(nm, "прокл")
+        if self.aff_ok("слеп") and "Вы ослепли" in clean:      # слепота: один каст «слово света» на каждое ослепление
+            if (getattr(self, "self_aff") or {}).get("Молч"):
+                self.send_raw("осуш фля.раз")
+            else:
+                self.send_raw("к слов.свет")
+        if clean.startswith("Вы прекратили следовать") and time.time() >= getattr(self, "refollow_t", 0):
+            self.refollow_t = time.time() + 15            # смерть/обрыв рвёт «след» — через 3 с идём за лидером снова
+            threading.Timer(3.0, self.refollow).start()
+        # страх: бегут ровно на одну клетку — «X убежал на юг»; свой шаг возвращаем, за напарником идём
+        m_fear = re.match(r"^(?:Вы|([А-ЯЁ][^.!]*?)) убежал[аи]? на (север|юг|восток|запад)", clean.strip())
+        if m_fear:
+            who = (m_fear.group(1) or "").strip()
+            d = m_fear.group(2)
+            if not who or who.lower() in ("вы", (NAME or "").lower()):
+                opp = {"север": "юг", "юг": "север", "восток": "запад", "запад": "восток"}[d]
+                self.send_raw(opp)
+                self.emit("sys", "страх: убежали на %s — возвращаюсь (%s)" % (d, opp))
+            else:
+                nm = self.member_by_form(who)
+                if nm and nm.lower() != (NAME or "").lower():
+                    self.send_raw("идти " + d)
+                    self.emit("sys", "%s убежал на %s — иду за ним" % (nm, d))
+        m_hold = re.match(r"^(?:Вы|([А-ЯЁ][^.!]*?)) замер\S* на месте,? не в силах", clean.strip())
+        if m_hold:                                        # реальная строка: «… замерли на месте, не в силах шевельнуться!»
+            who = (m_hold.group(1) or "").strip()
+            if who and who.lower() not in ("вы", (NAME or "").lower()):
+                nm = self.member_by_form(who)
+                if nm and nm.lower() != (NAME or "").lower():
+                    self.afflict(nm, "холд")              # себя не снять: ОР кидает напарник по столбцу «Холд»
+        m_cast = None
+        if clean.strip().startswith("Здесь темно"):
+            self.dark_seen = time.time()                  # клетку затемнили — clear_room скажет «слово света»
+        if re.match(r"^Вы хотите (есть|пить)", clean.strip()):
+            self.hunger_fix()                             # голод/жажда: насыщение
+        if "не смогли удержать" in low and "выронили" in low:   # слабость выбила оружие: поднять и надеть (как #action в JMC)
+            threading.Thread(target=self.pick_dropped, daemon=True).start()
+        if "мгновенно исцеляется от смертельной раны" in low and (self.cur or {}).get("vnum") == "503102" \
+                and time.time() >= getattr(self, "heart_t", 0):
+            self.heart_t = time.time() + 3               # сердце открылось — бьём лучом
+            self.emit("sys", "сердце бури исцеляется — пронзить лучом")
+            for _ in range(5):
+                self.send_raw("пронзить сердце бури")
+        if "снова можете" in low and "реген" in low:
+            self.regen_check()
+        if getattr(self, "regen", None) is not None:
+            m_r = re.search(r"(тадия|зорон).*?(\d+):(\d+)", low)
+            if m_r:
+                self.regen[m_r.group(1)] = int(m_r.group(2)) * 60 + int(m_r.group(3))
+        if "посох" in low and ("утратил силу" in low or "потерял силу" in low or "потеряла силу" in low
+                               or "погас" in low or "сила покинула" in low):
+            if time.time() - getattr(self, "staff_cast_t", 0) > 30:
+                self.staff_cast_t = time.time()
+                self.send_alias("заряжай")             # это алиас профиля, а не команда игры
+                self.emit("sys", "посох потерял силу — заряжай")
+        if "маг" in low and "пос" in low and "зем" in low:
+            m_t = re.search(r"(\d+):(\d+)", clean)
+            if m_t:
+                self.staff_until = time.time() + int(m_t.group(1)) * 60 + int(m_t.group(2))
+                self.emit("sys", "посох земли: остаток %s" % m_t.group(0))
+        # каменное проклятие: столбца в «пгр» нет, поэтому ловим по строке «Мряка начал медленно превращаться в камень...»
+        m_pet = re.match(r"^(?:Вы|(.+?)) (?:начал|стал)[аи]? (?:медленно )?(?:(?:превращаться|обращаться) в камень|каменеть)",
+                         clean.strip())
+        if m_pet:
+            who = (m_pet.group(1) or "").strip()
+            if who and who.lower() not in ("вы", (NAME or "").lower()):   # себя не лечим: на Тадию свиток читает Зорон, на Зорона — Тадия
+                nm = self.group_member(who)
+                if nm:
+                    self.afflict(nm, "камен")
+        # подтверждения снятия: отодвигаем следующий каст, чтобы зря не жечь фляги, свитки и освобождения
+        for pat, kind in ((r"^Утраченное мастерство вернулось к (.+?)\.?$", "забв"),
+                          (r"^Черное безмолвие отступило от (.+?)\.?$", "молч"),
+                          (r"^Живительная сила заполнила (.+?),", "камен")):
+            mm = re.match(pat, clean.strip())
+            if mm:
+                self.aff_clear(mm.group(1).strip(), kind)
+        if clean.strip().startswith("Болезнь отступила"):      # «Болезнь отступила, вы снова здоровы.»
+            self.aff_clear(None, "болезнь")
+        if clean.strip().startswith("Вы снова можете двигаться"):
+            self.aff_clear(NAME, "холд")
         if "вы усердно помолились" in low:
             self.presence.dump("ответ на проверку: " + clean.strip()[:140])
+        elif "древние осколки" in low and ("взял" in low or "взяла" in low or "дал" in low):
+            vn = (self.cur or {}).get("vnum", "")
+            if low.startswith("вы взяли") or "дал вам древние осколки" in low:
+                self.shards = getattr(self, "shards", 0) + 1
+                if vn:
+                    self.shard_done = getattr(self, "shard_done", set()) | {vn}
+            elif low.startswith("вы дали"):
+                self.shards = 0
+            if vn:
+                try:
+                    with open(os.path.join(HERE, f"осколки_{NAME}.log"), "a", encoding="utf-8") as f:
+                        f.write(f"{time.strftime('%d.%m %H:%M:%S')} {vn} {clean.strip()[:140]}\n")
+                except OSError:
+                    pass
+                self.emit("sys", f"ОСКОЛОК: клетка {vn}")
+        if "R.I.P." in clean:
+            self.kill_n = getattr(self, "kill_n", 0) + 1   # трупы обираем не сразу, а перед выходом из клетки
+            m_dead = re.match(r"^(.+?) мертв", clean.strip())
+            if m_dead and self.room and m_dead.group(1).strip().lower() not in ("кто-то", "кто-либо"):
+                key = m_dead.group(1).strip().lower()
+                self.room["mobs"] = [m for m in self.room["mobs"] if key not in m[0].lower()]
         elif "прошли проверку на ботинг" in low:
             self.presence.dump("проверка пройдена: " + clean.strip()[:140])
         elif "не прошли автоматическую проверку" in low:
@@ -1153,6 +1538,8 @@ class Mud:
             clean, cols = clean[k:], cols[k:]
             if not clean.strip():
                 return
+        # моб вошёл в комнату («Артиллерист I группы пришел с запада.») — землетрясение сразу, не ждём разбора комнаты
+        self.mob_arrived(clean)
         # таблица группы (команды гр / группа / пгр)
         if re.match(r"^\s+Имя\s+H\s", clean):
             self.grp = {"head": clean.rstrip(), "rows": [], "t": time.strftime("%H:%M:%S")}
@@ -1200,6 +1587,8 @@ class Mud:
             if not clean.strip():
                 return
             txt = clean.strip()
+            if txt.startswith("[Зона") or txt.startswith("["):   # подсказка зоны/служебная строка — не моб и не считаем в нумерации
+                return
             if ROOM_END.match(txt):     # событие после комнаты («Вы достигли пункта назначения.»), не моб
                 self.finish_room()
                 return
@@ -1244,6 +1633,19 @@ class Mud:
         o = m and getattr(self, "alias", {}).get(m.group(1).lower())
         return o + ln[m.end(1):] if o else ln
 
+    def aff_ok(self, kind):
+        """Можно ли нам снимать этот аффект: УД/забвение — всегда, остальное — только когда нет Олирона."""
+        if not AFF_TRIGGERS:
+            return False
+        if kind in AFF_ALWAYS:
+            return True
+        return not any(PALADIN in m["name"].lower() for m in (self.group or {}).get("members", []))
+
+    @staticmethod
+    def aff_on(v):
+        """Столбец группы: «Н» — аффекта нет; «Д», таймер «0:33» или число (Укр: -3 уровня) — есть."""
+        return (v or "").strip() not in ("", "Н", "-", "0:00")
+
     def finish_group(self):
         g, self.grp = self.grp, None
         if not g:
@@ -1270,7 +1672,119 @@ class Mud:
             members.append(m)
         self.track_polymorph(getattr(self, "group", None), members)
         self.group = {"t": g["t"], "head": [w for _, w in cols[1:]], "members": members}
+        self.grp_tbl_t = time.time()                     # когда таблица пришла (keep_group просит свежую)
         self.emit("group", self.group)
+        any_ukr = False
+        me = next((x for x in members if (NAME or "").lower() in re.sub(r"^\d+\s+", "", x["name"]).strip().lower()), None)
+        self.self_aff = ({k: self.aff_on(me["cols"].get(k))
+                          for k in ("Молч", "Холд", "Забв", "Укр", "Прокл", "Яд", "Болезнь")} if me else {})
+        muted = bool(self.self_aff.get("Молч"))                    # молчим — кастовать не можем вообще
+        # забвение (забыты касты), холд (не двигаемся) и УД (режет уровень и раскачку) — сначала снимаем с себя флягой
+        crippled = muted or bool(self.self_aff.get("Забв")) or bool(self.self_aff.get("Холд")) or bool(self.self_aff.get("Укр"))
+        for m in members:
+            nm = re.sub(r"^\d+\s+", "", m["name"]).strip()
+            if not nm:
+                continue
+            if "тади" in nm.lower():                     # в облике имя «Подгорная гнома Тадия» — приводим к своему
+                nm = "Тадия"
+            elif "зорон" in nm.lower():
+                nm = "Зорон"
+            if nm.lower() == NAME.lower():                # своё состояние — в первую очередь
+                if AFF_TRIGGERS and self.self_aff.get("Укр"):
+                    self.afflict(NAME, "укр")
+                    any_ukr = True
+                if (m["cols"].get("Мст") or "").strip().upper() == "Д" \
+                        and time.time() >= getattr(self, "mst_t", 0):
+                    self.mst_t = time.time() + 300
+                    self.send_raw("путь рента")           # месть: мобы позовут сбежавшего и убьют — сидим в ренте
+                    self.emit("sys", "Мст=Д — ухожу в клетку ренты (путь рента)")
+                if AFF_TRIGGERS and self.aff_on(m["cols"].get("Слеп")):    # своя слепота: слово света бьёт по всем, лечим сразу
+                    self.blind_self_t = time.time()
+                    self.afflict(NAME, "слеп")
+                # яд, болезнь, проклятие и камень с себя можно снять самому (в отличие от молча/холда/забвения)
+                for col, kind in (("Яд", "яд"), ("Болезнь", "болезнь"), ("Прокл", "прокл")):
+                    if AFF_TRIGGERS and self.aff_on(m["cols"].get(col)):
+                        self.afflict(NAME, kind)
+                if (m["cols"].get("Голод") or "").strip().upper() == "Д":
+                    self.hunger_fix()
+                if AFF_TRIGGERS and self.self_aff["Забв"]:
+                    if not getattr(self, "self_obl_armed", False):
+                        self.self_obl_armed = True
+                        threading.Timer(3.0, self.self_oblivion_check).start()
+                else:
+                    self.self_obl_armed = False
+                    self.oblivion_until = 0
+                if muted and self.aff_ok("молч"):                    # себя заклинанием не снять: сначала напарник, иначе фляга
+                    partner = "зорон" if (NAME or "").lower() == "тадия" else "тадия"
+                    pm = next((x for x in members
+                               if partner in re.sub(r"^\d+\s+", "", x["name"]).strip().lower()), None)
+                    p_mute = not pm or self.aff_on(pm["cols"].get("Молч"))     # напарника нет в таблице — считаем, что не поможет
+                    self.sil_since = getattr(self, "sil_since", 0) or time.time()
+                    if p_mute:
+                        if time.time() - self.sil_since >= 10 and time.time() >= getattr(self, "bandage_t", 0):
+                            self.bandage_t = time.time() + 30
+                            self.send_raw("перевязка")
+                            self.emit("sys", "молчание: фляга не помогла — перевязка")
+                        elif time.time() >= getattr(self, "mol_flask_t", 0):
+                            self.mol_flask_t = time.time() + 10
+                            self.send_raw("осуш фля.раз")             # напарник тоже молчит — фляга снимает молчание с себя
+                            self.emit("sys", "молчание: напарник тоже молчит — осуш фля.раз")
+                    elif time.time() - self.sil_since >= 15 and time.time() >= getattr(self, "mol_flask_t", 0):
+                        self.mol_flask_t = time.time() + 10              # напарник свободен, но за 15 с не снял — пьём сами
+                        self.send_raw("осуш фля.раз")
+                        self.emit("sys", "молчание: напарник не снял за 15 с — осуш фля.раз")
+                else:
+                    self.sil_since = 0
+                # холд с себя не снимаем: ор от напарника (Тадия <-> Зорон) или «свободная воля» паладина
+                continue
+            # порядок = приоритет: забвение, холд, молчание, проклятие, болезнь.
+            # Себя не трогаем — с напарником снимаем друг с друга (см. afflict), на остальных согрупниках — кто успеет.
+            if crippled:                                  # пока хромаем сами, касты по другим не пройдут — сначала флягу
+                continue
+            if self.aff_on(m["cols"].get("Забв")):
+                self.afflict(nm, "забв")
+            if (m["cols"].get("Голод") or "").strip().upper() == "Д":
+                self.hunger_fix(nm)                       # голоден согрупник — насыщение на него
+            if self.aff_on(m["cols"].get("Холд")):
+                self.afflict(nm, "холд")
+            if self.aff_on(m["cols"].get("Молч")):
+                self.afflict(nm, "молч")
+            if self.aff_on(m["cols"].get("Прокл")):
+                self.afflict(nm, "прокл")
+            if self.aff_on(m["cols"].get("Болезнь")):
+                self.afflict(nm, "болезнь")               # повторяем, пока в столбце не станет Н
+            pol = (m["cols"].get("Пол") or m["cols"].get("Полиморф") or "").strip()
+            m_pol = re.match(r"^(\d{1,3}):(\d{2})$", pol)   # длительность морфа: 0:18 / 00:18
+            if m_pol:
+                pol_s = int(m_pol.group(1)) * 60 + int(m_pol.group(2))
+            elif pol.isdigit():
+                pol_s = int(pol)
+            else:
+                pol_s = None
+            if pol_s is not None:
+                if not hasattr(self, "poly_now"):
+                    self.poly_now = {}
+                if not hasattr(self, "poly_init"):
+                    self.poly_init = {}
+                if self.poly_now.get(nm.lower()) is None:     # морф только прилетел: запоминаем его градацию
+                    self.poly_init[nm.lower()] = pol_s
+                self.poly_now[nm.lower()] = pol_s
+                if self.aff_ok("поли") and self.poly_init.get(nm.lower(), pol_s) <= 20:   # градация <= 6 (<= 20 с) — развеивается
+                    self.afflict(nm, "поли")
+                    if not hasattr(self, "poly_flask"):
+                        self.poly_flask = {}
+                    if not self.poly_flask.get(nm.lower()):
+                        self.poly_flask[nm.lower()] = True
+                        threading.Thread(target=self.poly_flask_loop, args=(nm,), daemon=True).start()
+                # больше 20 с (градация > 6) — не развеивается, ждём
+            else:
+                if hasattr(self, "poly_now"):
+                    self.poly_now[nm.lower()] = None
+                getattr(self, "poly_init", {}).pop(nm.lower(), None)
+        if not any_ukr:
+            self.soul_until = 0
+        # авто-призыв выключен: когда напарник уехал реколом по делам, призыв только мешает
+        # self.summon_check(members)
 
     def finish_map(self):
         blk, self.map_block = self.map_block, []
@@ -1283,27 +1797,726 @@ class Mud:
             self.emit("mobs", self.mobs)
 
     def finish_room(self):
-        if self.room_stage == "contents" and self.room:      # без «[ Exits: …]» это не комната (бирюзовая реплика чата и т.п.)
+        stage, self.room_stage = self.room_stage, None       # сбрасываем сразу: сбой ниже не оставит комнату «открытой» навсегда
+        if stage == "contents" and self.room:                # без «[ Exits: …]» это не комната (бирюзовая реплика чата и т.п.)
             self.room["desc"] = " ".join(x for x in self.room["desc"] if x)
             self.room_seq = getattr(self, "room_seq", 0) + 1
+            self.room_t = time.time()
             self.room["seq"] = self.room_seq
             self.room["vnum"] = (self.cur or {}).get("vnum")
             for m in self.room["mobs"]:
                 m[2] = mob_label(m[0])
             self.emit("room", self.room)
+            if (self.cur or {}).get("vnum") == "503015" and not getattr(self, "spirit_q", False):
+                self.spirit_q = True                     # квест у духа: только когда реально зашли в его клетку
+                self.emit("sys", "беру квест у духа святыни")
+                threading.Timer(0.8, self.spirit_ask).start()
             if self.autolook:
                 self.queue_unknown(self.room["mobs"])
+            self.auto_fight(self.room["mobs"])
         self.room_stage = None
 
+    def resolve_by_name(self, name):
+        """Строка моба в комнате по имени из карточки (карточка может быть без строки в тексте)."""
+        key = norm_line(name)
+        if not key:
+            return None
+        for mob in (self.room or {}).get("mobs") or []:
+            if key in norm_line(mob[0]):
+                return mob[0]
+        return None
+
+    def peaceful(self, line):
+        """Мирный моб (в карточке «Особенности: [Мирный]») — не враг: не бить и не кастовать по нему."""
+        key = norm_line(line)
+        try:
+            c = db()
+            rows = c.execute("select name,room from mob_cards where kind='мирный'").fetchall()
+            c.close()
+            for r in rows:
+                nm, rm = norm_line(r["name"] or ""), norm_line(r["room"] or "")
+                if (rm and rm == key) or (nm and nm in key):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def auto_fight(self, mobs):
+        """Тадия «пнуть» не умеет — бой ведут землетрясение (auto_quake) и Зорон; здесь ничего не шлём."""
+        return
+
+    def group_member(self, name):
+        """Имя участника группы по строке из игры (номер в таблице и «*» ЛД не в счёт), иначе None."""
+        key = norm_line(name)
+        for m in (self.group or {}).get("members", []) or []:
+            nm = re.sub(r"^\d+\s+", "", m["name"]).replace("*", "").strip()
+            if nm and norm_line(nm) == key:
+                return nm
+        return None
+
+    def member_by_form(self, word):
+        """Имя персонажа из строки в любом падеже: «Тэйросу», «Мряку», «вас» -> имя из таблицы группы."""
+        w = norm_line(word)
+        if w in ("вы", "вас", "вам", "вами"):
+            return NAME or ""
+        cands = [NAME or ""] + [re.sub(r"^\d+\s+", "", m["name"]).replace("*", "").strip()
+                                for m in (self.group or {}).get("members", []) or []]
+        for c in cands:
+            k = norm_line(c)
+            if not k:
+                continue
+            if w == k or w.rstrip("аяуюеёиыо") == k.rstrip("аяуюеёиыо"):
+                return c
+        return None
+
+    def aff_clear(self, name, kind):
+        """Подтверждение снятия: отодвигаем следующий каст этого аффекта (не жжём фляги и свитки)."""
+        now = time.time()
+        if not hasattr(self, "aff_t"):
+            self.aff_t = {}
+        if name is None:                                  # «Болезнь отступила…» — не назван, чистим все
+            for k in list(self.aff_t):
+                if k[1] == kind:
+                    self.aff_t[k] = now
+            return
+        nm = self.member_by_form(name)
+        if nm:
+            self.aff_t[(nm.lower(), kind)] = now
+
+    def afflict(self, name, kind):
+        """Снятие аффекта: молч/холд — осв.разу, забвение — раз.маг, прокл — обр.очищ, болезнь — сло.жи, камень — свиток."""
+        if not self.aff_ok(kind):
+            return                                        # выключено или Олирон снимает сам
+        if kind in ("молч", "холд", "забв") and (NAME or "").lower() in (name or "").lower():
+            return                                        # с себя не снять: снимает напарник (Тадия <-> Зорон)
+        key = (name.lower(), kind)
+        now = time.time()
+        # болезнь держим до «Н» в столбце — повторяем почаще; остальное — раз в несколько секунд
+        window = {"болезнь": 4, "молч": 6, "холд": 6, "забв": 8, "камен": 6}.get(kind, 15)
+        if now - getattr(self, "aff_t", {}).get(key, 0) < window:
+            return
+        if not hasattr(self, "aff_t"):
+            self.aff_t = {}
+        self.aff_t[key] = now
+        self.emit("sys", f"аффект: {kind} у {name} — снимаю")
+        self.send_raw("очистить")                        # универсально: очистить + освободить разум
+        self.send_raw("к осв.разу")
+        if kind in ("молч", "холд"):
+            self.send_raw("очистить")
+            self.send_raw("вст")
+            self.send_raw("перевязка " + name)            # молчание/холд снимает перевязка согрупника
+            self.send_raw("к осв.разу " + name)           # и ОР — только согрупником, не собой
+        elif kind == "слеп":
+            self.send_raw("к слов.свет")                 # массовая «лечить слепоту»
+        elif kind == "камен":
+            if (NAME or "").lower() in (name or "").lower():
+                return                                    # своё КП снимет свиток сам через минуту
+            self.send_raw("очистить")
+            self.send_raw("вст")
+            self.send_raw("зач камней " + name)          # свиток заклинателя камней — на согрупника
+        elif kind == "прокл":
+            self.send_raw("к об.оч")
+        elif kind in ("яд", "болезнь"):
+            self.send_raw("к сло.жи")
+        elif kind == "поли":
+            self.send_raw("к ра.маг " + name)             # длительность морфа — из столбца группы (см. finish_group)
+        elif kind == "укр":
+            self.send_raw("очистить")
+            self.send_raw("вст")
+            self.soul_until = time.time() + 50
+            self.soul_cmd = "осуш ми.освоб"              # УД снимается микстурой освобождения
+            threading.Thread(target=self.soul_loop, daemon=True).start()
+        elif kind == "забв":
+            self.send_raw("к раз.маг " + name)            # если за раунд не сняли — сам пьёт флягу (см. self_oblivion_check)
+
+    def soul_loop(self):
+        """Украдена душа: микстура освобождения каждые 0.5 с, пока душа не вернётся (столбец «Укр» не станет Н)."""
+        cmd = getattr(self, "soul_cmd", "осуш ми.освоб")
+        while time.time() < getattr(self, "soul_until", 0):
+            self.send_raw(cmd)
+            time.sleep(0.5)
+        self.emit("sys", "душа вернулась — осв больше не осушаю")
+
+    def self_oblivion_check(self):
+        """Своё забвение: если за раунд его не сняли — осуш фля.раз, пока мастерство не вернётся."""
+        if not (getattr(self, "self_aff") or {}).get("Забв"):
+            return
+        self.emit("sys", "забвение не сняли за раунд — осуш фля.раз")
+        self.oblivion_until = time.time() + 60
+        threading.Thread(target=self.oblivion_loop, daemon=True).start()
+
+    def oblivion_loop(self):
+        while time.time() < getattr(self, "oblivion_until", 0):
+            self.send_raw("осуш фля.раз")
+            time.sleep(2.0)
+        self.emit("sys", "забвение: мастерство вернулось, флягу больше не пью")
+
+    def partner_in_group(self):
+        partner = "зорон" if NAME.lower() == "тадия" else "тадия"
+        return any(partner in re.sub(r"^\d+\s+", "", m["name"]).strip().lower()
+                   for m in (self.group or {}).get("members", []))
+
+    def summon_check(self, members):
+        """Напарник «Рядом: Н» и область создавали мы в группе — призываем его к себе."""
+        if NAME.lower() not in ("тадия", "зорон") or not (getattr(self, "created_area", False) or self.partner_in_group()):
+            return
+        if (self.cur or {}).get("area", "") not in ZONE_AREAS:
+            self.notnear_since = 0
+            return
+        partner = "зорон" if NAME.lower() == "тадия" else "тадия"
+        near = None
+        for m in members:
+            nm = re.sub(r"^\d+\s+", "", m["name"]).strip().lower()
+            if nm == partner:
+                near = m["cols"].get("Рядом")
+                break
+        if near is None:
+            near = "Н"                                   # напарника нет в таблице (другая зона) — считаем, что не рядом
+        now = time.time()
+        if near == "Н":
+            if not getattr(self, "notnear_since", 0):
+                self.notnear_since = now
+            elif now - self.notnear_since > 5:           # рядом Н дольше 5 с — зовём (без ограничения повторов)
+                self.summon_t = now
+                self.send_raw("к призыв " + partner)
+                self.emit("sys", f"{partner} рядом Н — призываю")
+        else:
+            self.notnear_since = 0
+
+    def group_names(self):
+        """Имена из последней таблицы группы: без номера, «*» ЛД и без питомцев (они со строчной)."""
+        out = []
+        for m in (self.group or {}).get("members") or []:
+            nm = re.sub(r"^\d+\*?\s*", "", m["name"]).replace("*", "").strip()
+            if nm and nm[:1].isupper() and nm.lower() != (NAME or "").lower():
+                out.append(nm)
+        return out
+
+    def summon_far(self):
+        """Алиас «сумм»: «к призыв <имя>» всем, у кого в таблице группы «Рядом: Н» (себя и питомцев не зовём).
+
+        Если в группе Карис — призываем снизу таблицы (её клиент зовёт сверху), чтобы не дублировать друг друга.
+        """
+        members = (self.group or {}).get("members") or []
+        if not members:
+            self.emit("sys", "сумм: таблицы группы нет — сначала «гр»")
+            return
+        if not any("Рядом" in m["cols"] for m in members):
+            self.emit("sys", "сумм: в таблице группы нет столбца «Рядом» — сделайте «гр»")
+            return
+        far = []
+        for m in members:
+            nm = re.sub(r"^\d+\*?\s*", "", m["name"]).replace("*", "").strip()
+            if not nm or nm[:1].islower() or (NAME or "").lower() in nm.lower():
+                continue                                   # питомцы (со строчной) и сам — не призываем
+            if (m["cols"].get("Рядом") or "").strip().upper() == "Н":
+                far.append(nm)
+        if not far:
+            self.emit("sys", "сумм: все рядом, призывать некого")
+            return
+        if getattr(self, "summon_busy", False):
+            self.emit("sys", "сумм: уже призываю, подождите")
+            return
+        with_karis = any(nm.lower() == "карис" for nm in self.group_names())
+        if with_karis:
+            far.reverse()                                  # Карис в группе: она зовёт сверху, мы снизу
+        self.summon_busy = True
+        self.emit("sys", "сумм: призываю %s — %s" % ("снизу" if with_karis else "сверху", ", ".join(far)))
+        threading.Thread(target=self.summon_loop, args=(far,), daemon=True).start()
+
+    def summon_loop(self, names):
+        """Призыв по одному с паузой ~1,6 с: подряд игра касты не принимает."""
+        try:
+            for i, nm in enumerate(names):
+                if i:
+                    time.sleep(1.6)
+                self.send_raw("к призыв " + nm)
+        finally:
+            self.summon_busy = False
+
+    def hostile_mobs(self):
+        """Враги в комнате: не свои, не мирные, не барьер (он снимается, когда убьют следопыта)."""
+        out = []
+        for m in (self.room or {}).get("mobs") or []:
+            line = m[0]
+            if line.lstrip().startswith("[") or "барьер" in line.lower():
+                continue
+            if line.startswith("Труп") or line.lower().startswith("внутри трупа"):
+                continue                                     # трупы — не живые мобы
+            if "дух потерянной святыни" in line.lower():      # дух у алтаря — не враг, его не бьём
+                continue
+            if self.is_ours(line) or self.peaceful(line):
+                continue
+            core = re.sub(r"\s*\(.*?\)|\s*\.\.\..*$", "", line).strip()
+            if re.search(r"\s[А-ЯЁ][а-яё]+(,| (стоит|сидит|летает|отдыхает|спит|лежит|сражается)\b)", core) and "здесь" in core:
+                continue
+            out.append(m)
+        return out
+
+    def partner_near(self):
+        """«Рядом» напарника из последней таблицы группы: True — рядом, False — нет, None — не знаем."""
+        partner = "зорон" if (NAME or "").lower() == "тадия" else "тадия"
+        for m in (self.group or {}).get("members", []):
+            nm = re.sub(r"^\d+\*?\s*", "", m["name"]).replace("*", "").strip().lower()
+            if nm == partner:
+                v = (m["cols"].get("Рядом") or "").strip().upper()
+                return None if not v else (v != "Н")
+        return None
+
+    def keep_group(self, st, limit=30):
+        """Напарник не рядом (страх, бегство, обрыв): зовём и ждём, дальше по маршруту не идём."""
+        if not st.get("run") or not self.partner_in_group():
+            return
+        if time.time() - getattr(self, "grp_tbl_t", 0) > 10:     # таблица старая — сначала свежая
+            self.grp_tbl_t = time.time()
+            self.send_raw("пгр боле здоро ряд пози холд молч слеп яд")
+            time.sleep(1.5)
+        if self.partner_near() is not False:
+            return
+        partner = "зорон" if (NAME or "").lower() == "тадия" else "тадия"
+        t0 = time.time()
+        self.bot_say("напарник не рядом — зову и жду (до %d с)" % limit)
+        while st.get("run") and time.time() - t0 < limit:
+            if time.time() >= getattr(self, "summon_t", 0):
+                self.summon_t = time.time() + 5
+                self.send_raw("к призыв " + partner)
+            time.sleep(1.0)
+            if self.partner_near() is not False:
+                self.bot_say("напарник снова рядом")
+                return
+            if time.time() >= getattr(self, "grp_t", 0):   # таблица могла не обновиться — просим свежую
+                self.grp_t = time.time() + 3
+                self.send_raw("пгр боле здоро ряд пози холд молч слеп яд")
+        self.bot_say("напарник так и не рядом — иду дальше")
+
+    def dark_fix(self):
+        """«Здесь темно» (слово тьмы): в темноте труп не обобрать — слово света."""
+        if (self.cur or {}).get("area", "") not in ZONE_AREAS:
+            return
+        if time.time() - getattr(self, "dark_seen", 0) > 6 or time.time() < getattr(self, "dark_t", 0):
+            return
+        self.dark_t = time.time() + 20
+        self.send_raw("к слов.свет")
+        self.emit("sys", "клетка тёмная — слово света")
+
+    def clear_room(self, st, moved=False):
+        """Клетка: землетрясение → смотреть; есть мобы — ещё раз; потом дебаффы/позиция всей группы."""
+        if moved:                                        # ждём, пока придёт описание НОВОЙ клетки
+            cur_v = (self.cur or {}).get("vnum")
+            seq = getattr(self, "room_seq", 0)
+            end = time.time() + 0.8
+            while time.time() < end and ((self.room or {}).get("vnum") != cur_v
+                                         or getattr(self, "room_seq", 0) <= seq):
+                time.sleep(0.05)
+        in_zone = (self.cur or {}).get("area", "") in ZONE_AREAS
+        if in_zone and (self.cur or {}).get("vnum") != "503015":   # у духа святыни землетрясением не бьём
+            for k in range(2):                           # второй раз — только по свежей комнате, иначе бьём впустую
+                if not self.hostile_mobs():
+                    break
+                self.send_raw("к землетряс")
+                seq = getattr(self, "room_seq", 0)
+                time.sleep(0.2)
+                self.send_raw("смотреть")
+                end = time.time() + 1.2
+                while time.time() < end and getattr(self, "room_seq", 0) <= seq:
+                    time.sleep(0.1)
+                if getattr(self, "room_seq", 0) <= seq:   # комната не обновилась — второй раз не бьём
+                    break
+        self.dark_fix()
+        self.keep_group(st)
+        gate_end = time.time() + 20                      # shortcut: ждём снятия не дольше 20 с, потом идём дальше
+        while AFF_TRIGGERS and st.get("run") and time.time() < gate_end:
+            bad = []
+            for m in (self.group or {}).get("members", []):
+                nm = re.sub(r"^\d+\s+", "", m["name"]).strip()
+                for col, kind in self.DEBUFF_COLS:
+                    if self.aff_ok(kind) and self.aff_on(m["cols"].get(col)):
+                        bad.append((nm, kind))
+                pos = (m["cols"].get("Позиция") or "").strip()
+                if pos and not pos.startswith("Стоит"):
+                    bad.append((nm, "позиция"))
+            if not bad:
+                break
+            for nm, kind in bad:
+                if kind == "позиция":
+                    continue
+                if kind == "поли":                       # морф > 20 с не развеиваем — ждём; короткий снимаем
+                    dur = (getattr(self, "poly_now", {}) or {}).get(nm.lower())
+                    if dur is not None and dur <= 20:     # таймер известен и короткий — развеиваем
+                        self.afflict(nm, "поли")
+                    continue
+                self.afflict(nm, kind)                   # триггер мог не успеть — досылаем снятие
+            time.sleep(0.5)
+        return not self.hostile_mobs()
+
+    def pick_dropped(self):
+        """Выронили из рук: поднимать и надевать, пока вещи не вернутся.
+        В холде/слепоте «взя все» не пройдёт — повторяем, пока не снимут холд/слепоту и вещи не окажутся в руках."""
+        self.drop_pending = True
+        if getattr(self, "drop_busy", False):            # повтор той же строки в пачке — не дублируем поток
+            return
+        self.drop_busy = True
+        try:
+            want = self.CHEK_EXPECT.get((NAME or "").lower())
+            for _ in range(40):                          # ~2 минуты попыток, дальше — предупреждение
+                if not getattr(self, "drop_pending", False) or self.state != "game":
+                    break
+                self.send_raw("взя все")
+                time.sleep(0.5)
+                self.send_raw("од все")
+                time.sleep(1.0)
+                if not getattr(self, "chek_q", None):
+                    rows = self.chek_read_eq()
+                    if not want or (rows and len(rows) >= want):
+                        self.drop_pending = False
+                        self.emit("sys", "оружие снова в руках")
+                        break
+                time.sleep(3.0)
+            if getattr(self, "drop_pending", False):
+                self.emit("sys", "оружие не поднялось — уйдёт на склад через 1–20 минут (проверь там)")
+        finally:
+            self.drop_busy = False
+
+    def quake_now(self, why=""):
+        """Землетрясение по событию (моб вошёл) — не дожидаясь разбора комнаты."""
+        if NAME.lower() not in self.DRUID:
+            return False
+        if (self.cur or {}).get("area", "") not in ZONE_AREAS:   # в городе не кастуем
+            return False
+        if time.time() < getattr(self, "quake_guard", 0):
+            return False
+        self.quake_guard = time.time() + 1.5
+        self.send_raw("к землетряс")
+        self.emit("sys", "землетрясение: " + (why or "моб в комнате"))
+        return True
+
+    def regen_check(self):
+        """«Вы можете снова … регенерация» (кд 6 мин): обновляем на Тадии и Зороне."""
+        if NAME.lower() != "тадия":
+            return
+        self.send_raw("к реген тадия")
+        self.send_raw("к реген зорон")
+        self.emit("sys", "регенерация: обновила на Тадии и Зороне (кд 6 мин)")
+
+    def regen_pick(self):
+        r = getattr(self, "regen", None)
+        self.regen = None
+        if r is None:
+            return
+        t, z = r.get("тадия"), r.get("зорон")
+        if t is None and z is None:
+            self.send_raw("к реген тадия")
+            self.send_raw("к реген зорон")
+            self.emit("sys", "регенерация: таймеров нет — на обоих")
+        elif t is None or (z is not None and t < z):
+            self.send_raw("к реген тадия")
+            self.emit("sys", "регенерация: на Тадию (%s)" % (t if t is not None else "нет"))
+        else:
+            self.send_raw("к реген зорон")
+            self.emit("sys", "регенерация: на Зорона (%s)" % (z if z is not None else "нет"))
+
+    def poly_flask_loop(self, name):
+        """Полиморф < 20 с: пьём флягу, пока столбец не очистится (или 40 с)."""
+        key = name.lower()
+        end = time.time() + 40
+        try:
+            while time.time() < end:
+                sec = (getattr(self, "poly_now", {}) or {}).get(key)
+                if not sec or sec >= 20:
+                    break
+                self.send_raw("осуш фля.раз")
+                time.sleep(2.0)
+        finally:
+            getattr(self, "poly_flask", {}).pop(key, None)
+
+    def send_alias(self, c):
+        """Выполнить строку как алиас профиля (заряжай и т.п.), а не как команду игры."""
+        try:
+            if self.profile:
+                for x in self.profile.expand(c, notes=[]):
+                    self.send_cmd(x)
+                return
+        except Exception:
+            pass
+        self.send_raw(c)
+
+    def spirit_ask(self):
+        """Дух святыни: зашли в клетку — «г помогу», затем «г да»."""
+        self.send_raw("г помогу")
+        time.sleep(1.0)
+        self.send_raw("г да")
+
+    def staff_charge(self, why=""):
+        """Заряжаем магический посох: снять 18-ю вещь, надеть розу, «посох», одеть обратно (как алиас «заряжай»)."""
+        self.staff_cast_t = time.time()
+        for c in ("сня 18.", "од роза", "посох", "од все"):
+            self.send_raw(c)
+            time.sleep(0.4)
+        self.staff_until = 0                          # точный остаток придёт строкой «магический посох: земля M:SS»
+        self.emit("sys", "магический посох: заряжаю" + (" — " + why if why else ""))
+
+    def healers(self):
+        """Имена мобов-хилеров из базы (в карточке есть «исцеление»)."""
+        if getattr(self, "_healers", None) is None:
+            s = set()
+            try:
+                c = db()
+                for n, sk in c.execute("select name, skills from mob_cards"):
+                    if n and sk and "исцел" in sk.lower():
+                        s.add(norm_line(n))
+                c.close()
+            except Exception:
+                pass
+            self._healers = s
+        return self._healers
+
+    def healer_in_room(self):
+        """Хилер в клетке: его бьём/переключаемся первым (иначе он отлечивает цель)."""
+        hs = self.healers()
+        for m in (self.room or {}).get("mobs") or []:
+            line = m[0] or ""
+            if line.startswith("Труп") or self.is_ours(line) or self.peaceful(line):
+                continue
+            core = re.sub(r"\s*\(.*?\)|\s*\.\.\..*$", "", line).strip()
+            nm = re.sub(r"^(?:[А-ЯЁ][а-яё]+ )?(?:[А-ЯЁ][а-яё]+ )", "", core)   # грубо: без прилагательных
+            for cand in (norm_line(core), norm_line(nm)):
+                if cand in hs:
+                    return core.lower()
+        return ""
+
+    def fight_act(self):
+        """Бой: Тадия бьёт землетрясением, Зорон — пнуть по цели, хилеров переключаем первыми."""
+        st = self.st or {}
+        f = st.get("fight")
+        tgt = (f[0] if isinstance(f, list) else str(f or "")).strip()
+        me_fight = tgt
+        if not me_fight:                                  # «fight» в MSDP бывает пустым — смотрим комнату и столбец
+            mobs = self.hostile_mobs()
+            if mobs:
+                line = mobs[0][0]
+                me_fight = re.sub(r"\s*\(.*?\)|\s*\.\.\..*$", "", line).strip().lower()
+        if not me_fight:
+            for m in (self.group or {}).get("members", []):
+                nm = re.sub(r"^\d+\s+", "", m["name"]).strip().lower()
+                if nm == (NAME or "").lower() and (m["cols"].get("Позиция") or "").startswith("Сражается"):
+                    me_fight = "цель"
+                    break
+        if not me_fight:
+            return
+        now = time.time()
+        if (NAME or "").lower() in self.DRUID:
+            if (self.cur or {}).get("area", "") not in ZONE_AREAS:
+                return                                   # в городе землетрясением не бьём (мирных жителей положили)
+            if not self.hostile_mobs():
+                return                                   # в клетке нет агро-моба — кастовать не по кому
+            if self.group_debuffs():
+                return                                   # пока есть дебафф — сначала снимаем, землетряс не кастуем
+            self.send_raw("к землетряс")                  # в бою кастуем каждый раунд, свой кд игра сама держит
+            self.emit("sys", "землетрясение (бой): цель «%s», в комнате: %s" % (me_fight[:30], "; ".join(m[0][:30] for m in self.hostile_mobs()[:3])))
+            return
+        # «пнуть» по сражающейся цели не проходит — не спамим; хилер: сражается с нами/Зороном -> переключ
+        if self.healer_in_room() and now - getattr(self, "sw_t", 0) > 15:
+            self.sw_t = now
+            self.send_raw("переключ " + self.healer_in_room())
+            self.emit("sys", "бой: переключаюсь на хилера — " + self.healer_in_room())
+
+    def hunger_fix(self, name=None):
+        """Голод/жажда: игра пишет «Вы хотите есть/пить» или в таблице столбец «Голод» = Д — кастуем насыщение."""
+        now = time.time()
+        if now < getattr(self, "hunger_t", 0):
+            return
+        self.hunger_t = now + 60
+        if name and name.lower() != (NAME or "").lower():
+            self.send_raw("к насыщение " + name)
+            self.emit("sys", "насыщение: на " + name)
+        else:
+            self.send_raw("к насыщение")
+            self.emit("sys", "насыщение: на себя")
+
+    def cols_setup(self):
+        """Один раз за сессию добавляем в таблицу группы столбцы, которых у Тадии нет: слепота, яд, болезнь."""
+        if getattr(self, "cols_added", False):
+            return
+        self.cols_added = True
+        for c in ("столб доб слеп", "столб доб яд", "столб доб болезнь"):
+            self.send_raw(c)
+            time.sleep(0.3)
+        self.emit("sys", "таблица группы: добавил столбцы слеп/яд/болезнь")
+
+    def is_blind(self):
+        if not self.aff_ok("слеп"):
+            return False                                  # слепоту не лечим (выключено или Олирон) — и не блокируем реск/бой
+        now = time.time()
+        if now - getattr(self, "blind_self_t", 0) < 60:
+            return True
+        return any(now - t < 60 for t in (getattr(self, "blind_seen", {}) or {}).values())
+
+    def cure_first(self):
+        """Бой: первым делом снимаем слепоту (массовое «слово света») — без неё ни реск, ни дебаффы, ни лут."""
+        if not self.aff_ok("слеп"):
+            return False
+        now = time.time()
+        if now < getattr(self, "cure_t", 0):
+            return False
+        if not self.is_blind():
+            return False
+        self.cure_t = now + 1.5
+        if (getattr(self, "self_aff") or {}).get("Молч"):
+            return False                                  # молчим — снимает напарник своим окном
+        self.send_raw("к слов.свет")
+        self.emit("sys", "слепота — слово света (первым делом)")
+        return True
+
+    def regen_keep(self):
+        """Регенерация: каждый клиент держит её на СЕБЕ (кинуть на двоих одним кастом нельзя — уходит в кд)."""
+        now = time.time()
+        if now < getattr(self, "regen_t", 0):
+            return
+        left = getattr(self, "regen_until", 0) - now
+        seen_ago = now - getattr(self, "regen_seen_t", 0)
+        if seen_ago < 20 and left > 120:                  # в «аф» регенерация есть и жить ей ещё долго
+            return
+        self.regen_t = now + 60
+        self.send_raw("к реген " + (NAME or "").lower())
+        self.emit("sys", "регенерация: обновляю на себе (%s)"
+                  % ("осталось %d с" % int(left) if left > 0 else "не видно в «аф»"))
+
+    def staff_check(self):
+        """Тадия: раз в 10 с «аф» — оттуда яд/болезнь (к сло.жи) и остаток посоха (< 60 с — заряжай)."""
+        if NAME.lower() != "тадия":
+            return
+        now = time.time()
+        if (self.cur or {}).get("area", "") not in ZONE_AREAS and not getattr(self, "staff_on", False):
+            return
+        if now - getattr(self, "aff_q_t", 0) > 10:
+            self.aff_q_t = now
+            self.aff_open = now
+            self.send_raw("аф")
+        left = getattr(self, "staff_until", 0) - now
+        # автозарядку выключил: «заряжай» тратит розы и снимает вещи, пользователь делает это сам
+        if getattr(self, "staff_until", 0) and left < 60 and now - getattr(self, "staff_warn_t", 0) > 60:
+            self.staff_warn_t = now
+            self.emit("sys", "посох земли: осталось %d с — пора «заряжай»" % max(0, int(left)))
+
+    def affects_line(self, clean):
+        """Строки «аф»: «яд: слабое недомогание [2] 4:03», «магический посох: земля 18:19» и т.п."""
+        if not getattr(self, "aff_open", 0) or time.time() - self.aff_open > 3:
+            return
+        if "слепот" in clean.lower() and re.search(r"\d+:\d{2}", clean):
+            self.blind_self_t = time.time()             # слепота в «аф» (без двоеточия после названия) — тоже сигнал
+        if "регенерац" in clean.lower():                 # «регенерация: степень 11 [11] 17:08» / «быстрая регенерация [6]»
+            self.regen_seen_t = time.time()
+            mr = re.search(r"(\d+):(\d{2})", clean)
+            if mr:
+                self.regen_until = time.time() + int(mr.group(1)) * 60 + int(mr.group(2))
+            elif time.time() > getattr(self, "regen_until", 0):
+                self.regen_until = time.time() + 1800    # без таймера в «аф» — считаем, что висит (30+ мин)
+        m = re.match(r"^\s*([А-Яа-яЁё][А-Яа-яЁё' ]*?):\s*(.*?)(\d+):(\d{2})\s*$", clean)
+        if not m:
+            return
+        name = m.group(1).strip().lower()
+        sec = int(m.group(3)) * 60 + int(m.group(4))
+        if self.aff_ok("яд") and ("яд" in name or "болезн" in name):   # яд/болезнь: слово жизни, панацею не ждём
+            if time.time() - getattr(self, "cure_t", 0) > 15:
+                self.cure_t = time.time()
+                self.send_raw("к сло.жи")
+                self.emit("sys", "аффект %s (%d с) — к сло.жи" % (name, sec))
+        if ("посох" in name or "посох" in m.group(2).lower()) and "земл" in (name + m.group(2).lower()):
+            self.staff_until = time.time() + sec
+
+    def auto_quake(self, mobs):
+        """Друид (Тадия): в зоне, если в комнате есть мобы — землетрясение (не чаще раза в 8 с)."""
+        if (self.cur or {}).get("area", "") not in ZONE_AREAS:
+            return
+        real = self.hostile_mobs()
+        if real:
+            self.quake_now("в комнате мобов %d" % len(real))
+
+    def known_mob_name(self, who):
+        """Моб (есть карточка в базе/CSV), а не игрок и не питомец."""
+        key = norm_line(who)
+        return bool(key) and key in mob_names()
+
+    def mob_arrived(self, line):
+        """Моб вошёл: «Артиллерист I группы пришел с запада.» — землетрясение сразу.
+
+        Глагол любой на «при…» (прилетел, приполз, приковылял, припрыгала, прибрел…). В своих зонах бьём по
+        любому вошедшему не своему, вне зон — только по известному мобу из карточек, чтобы не задеть игрока.
+        """
+        m = ARRIVE.match(line.strip())
+        if not m:
+            return False
+        who = m.group(1).strip()
+        if not who or who.lower() in ("вы", (NAME or "").lower()):
+            return False
+        if self.is_ours(who) or self.peaceful(who):
+            return False
+        if (self.cur or {}).get("area", "") in ZONE_AREAS or self.known_mob_name(who):
+            return self.quake_now("вошёл: " + who[:40])
+        return False
+
     # ---------- автоосмотр незнакомых мобов ----------
+    def zone_cards(self, zone):
+        """Строки мобов, для которых карточка уже есть ИМЕННО в этой зоне (карточки других зон не в счёт).
+
+        Кроме game.db учитываем строки из карточки_мобов.csv и mob_lines: в базе на «зона+имя» одна строка,
+        а у моба бывают разные описания («кружит над вами» / «сидит здесь, сражается…»), и подпись в комнате
+        берётся из CSV — иначе осматривали бы моба, у которого уже видно имя/профу/уровень.
+        """
+        zone = zone or ""
+        lines = set()
+        try:
+            c = db()
+            lines |= {norm_line(r[0]) for r in c.execute("select room from mob_cards where zone=?", (zone,)) if r[0]}
+            lines |= {norm_line(r[0]) for r in c.execute("select line from mob_lines where zone=?", (zone,)) if r[0]}
+            c.close()
+        except Exception:
+            pass
+        lines |= csv_zone_lines().get(zone.strip().lower(), set())
+        return {x for x in lines if x}
+
+    def cur_zone(self):
+        """Зона текущей комнаты: из MSDP, а если после переподключения его ещё нет — по vnum из живой карты/базы."""
+        cur = self.cur or {}
+        if cur.get("area"):
+            return cur["area"]
+        vn = str(cur.get("vnum") or "")
+        if vn:
+            live = LIVE.get(vn)
+            if live:
+                return live[0] or ""
+            try:
+                c = db()
+                r = c.execute("select zone from rooms where vnum=?", (vn,)).fetchone()
+                c.close()
+                if r and r[0]:
+                    return r[0]
+            except Exception:
+                pass
+        return ""
+
     def queue_unknown(self, mobs):
-        kn = known_lines()
+        zone = self.cur_zone()
+        if not zone:                                    # только что переподключились — MSDP ещё не пришёл
+            n = int(getattr(self, "_unk_tries", 0) or 0)
+            if n < 3:
+                self._unk_tries = n + 1
+                threading.Timer(2.0, lambda: self.queue_unknown(mobs)).start()
+                return
+            self._unk_tries = 0
+        else:
+            self._unk_tries = 0
+        zc = self.zone_cards(zone)
         self.look_queue = []
         self.looking.clear()
         # нумерация как в BotCore/MudParse.js: существа в комнате с 2 (1 — ты сам), игроки и чармисы тоже занимают номер;
         # слово из строки не годится — «Темный всадник сеет чуму» в карточке «Сеятель чумы»
         gnames = [re.sub(r"^\d+\s+", "", m["name"]).lower() for m in (self.group or {}).get("members", [])]
         for line, _c, _l, pos in mobs:
+            if line.lstrip().startswith("["):
+                continue                                     # подсказка зоны/служебная строка — не существо
+            if "#####" in line or "¦" in line or line.strip().startswith(("-", "Имя")):
+                continue                                     # таблица группы/линейка — не существо (раньше шли «смотреть 20.»)
             if any(n and re.search(r"(?<![а-яё])" + re.escape(n) + r"(?![а-яё])", line.lower()) for n in gnames):
                 continue                                     # свои из группы (по таблице пгр), в т.ч. без расы в строке: «Мряка летает здесь»
             core = re.sub(r"\s*\(.*?\)|\s*\.\.\..*$", "", line).strip()
@@ -1311,7 +2524,9 @@ class Mud:
             if re.search(r"\s[А-ЯЁ][а-яё]+(,| (стоит|сидит|летает|отдыхает|спит|лежит|сражается)\b)", core) and "здесь" in core:
                 continue
             nl = norm_line(line)
-            if nl and nl not in kn and time.time() - self.look_skip.get(nl, 0) > 300 and not mob_label(line):
+            if nl and (nl in known_lines() or nl in zc):
+                continue                                 # карточка уже есть (пусть и в другой зоне) — подпись видна, смотреть незачем
+            if nl and time.time() - self.look_skip.get(nl, 0) > 300:
                 self.look_queue.append(("смотреть %d." % (pos + 2), line))
         if self.look_queue:
             self.emit("sys", "Незнакомых мобов: %d — осматриваю." % len(self.look_queue))
@@ -1337,6 +2552,8 @@ class Mud:
             return
         ls, self.card_lines = self.card_lines, None
         m = MOBHEAD.match(ls[0])
+        if not m:
+            return
         card = {"name": m[1], "level": int(m[2]), "cls": m[3], "flags": [], "hp": "", "mana": "", "skills": "",
                 "desc": [], "race": "", "cond": ""}
         for s in ls[1:]:
@@ -1359,18 +2576,56 @@ class Mud:
         card["desc"] = " ".join(card["desc"])
         self.card = card
         self.emit("card", card)
-        if self.looking:
+        # строку моба берём из автоосмотра, из ручного «см …» или из самой карточки
+        line = None
+        if self.looking:                                  # карточки приходят в порядке отправленных «смотреть»
             line = self.looking.popleft()[0]
+        else:
+            rq = getattr(self, "look_req", None)
+            if rq and time.time() - rq[1] < 20 and rq[2] == (self.cur or {}).get("vnum"):
+                line = self.resolve_look(rq[0])
+                self.look_req = None
+        if not line:
+            line = card_room_line(ls)
+        if line:                                          # строка моба должна быть в тексте карточки; иначе ищем её по имени
+            d = norm_line(card["desc"])
+            if norm_line(line) not in d:
+                alt = next((e for e in list(self.looking) if norm_line(e[0]) in d), None)
+                if alt:
+                    self.looking.remove(alt)
+                    line = alt[0]
+                else:
+                    line = self.resolve_by_name(card["name"])
+                    if not line:
+                        self.emit("sys", f"Карточка {card['name']}: строка моба не совпала — не записываю")
+        if line:
             try:
                 save_card(card, line, self.cur)
                 self.emit("sys", f"Карточка записана: {card['name']} (ур. {card['level']}, {card['cls']}).")
                 if self.room:                          # окно «Комната и моб» перерисовать: у нового моба теперь есть подпись
-                    for m in self.room["mobs"]:
-                        m[2] = mob_label(m[0])
+                    for mob in self.room["mobs"]:
+                        mob[2] = mob_label(mob[0])
                     self.emit("room", self.room)
             except OSError as e:
                 self.emit("sys", f"Карточку не записал: {e}")
             threading.Timer(0.05, self.pump_look).start()
+
+    def resolve_look(self, arg):
+        """«см 3.» / «см монах» -> строка моба в текущей комнате (для записи карточки)."""
+        if not self.room:
+            return None
+        arg = (arg or "").strip().rstrip(".").strip()
+        mobs = self.room.get("mobs") or []
+        if arg.isdigit():
+            i = int(arg) - 1
+            return mobs[i][0] if 0 <= i < len(mobs) else None
+        key = arg.lower()[:4]
+        if key:
+            for mob in mobs:
+                if re.search(r"(?<![а-яё])" + re.escape(key), mob[0].lower()):
+                    return mob[0]
+        return None
+
 
     # ---------- MSDP ----------
     def request_msdp(self):
@@ -1506,12 +2761,26 @@ class Mud:
         if self.state in ("pass", "charset", "user", "off"):
             self.emit("sys", "Команда не отправлена: идёт вход в игру (пароль вводит человек).")
             return
+        if self.state == "menu":
+            self.emit("sys", "меню персонажа — команда уходит в игру как есть")   # не блокируем: смерть/выбор перса
         if self.state == "wait_pass" and s.strip() and not USER:        # человек сам ввёл имя аккаунта — запомнить
             remember_account(s.strip())
         for ln in s.split("\n"):
             self.emit("echo", ln)
+            mlook = re.match(r"^(?:см|смотр\S*|look)\s+(.+)$", ln.strip(), re.I)
+            if mlook:
+                self.look_req = (mlook.group(1).strip(), time.time(), (self.cur or {}).get("vnum"))
             if ln.strip().lower().startswith("мол"):
                 plog("%s: в игру уходит «%s»" % (NAME, ln.strip()))
+            if ln.strip().lower() == "сумм" and self.state == "game":
+                self.summon_far()                       # алиас: призыв всех, у кого «Рядом: Н»
+                continue
+            if ln.strip().lower() in ("рас", "расс") and self.state == "game":
+                threading.Thread(target=self.do_rest, args=(True,), daemon=True).start()   # оба перса
+                continue
+            if ln.strip().lower() == "ремонт" and self.state == "game":
+                self.repair_run("вручную", force=True)   # вручную всегда идём: «путь ремонт» -> «гг !чин все»
+                continue
             if self.profile and re.match(r"^#(alias|action|unalias|unaction|hot|unhot|variable|group)\b", ln.strip(), re.I):
                 self.emit("sys", self.profile.command(ln.strip()))      # как в JMC: #alias/#action из строки ввода -> в профиль
                 self.emit("profile", True)
@@ -1535,10 +2804,125 @@ class Mud:
     CHEK_EXPECT = {"зорон": 17, "тадия": 18, "кейб": 18}       # сколько вещей должно быть надето
     CHEK_ITEMS = [("панац", 5, "ПАНАЦЕИ"), ("камней", 5, "КАМНЕЙ"), ("охр", 10, "ОХРАНОК"),
                   ("освоб", 10, "ОСВОБОЖДЕНИЯ"), ("фляг", 4, "ФЛЯГ")]    # ключ для осм, порог, что МАЛО
+    # дебаффы из столбцов группы, которые проверяем перед сменой клетки; баффы (регенерация, прилив сил и пр.) не трогаем
+    DEBUFF_COLS = (("Холд", "холд"), ("Молч", "молч"), ("Прокл", "прокл"), ("Пол", "поли"),
+                   ("Забв", "забв"), ("Укр", "укр"), ("Слеп", "слеп"), ("Яд", "яд"), ("Болезнь", "болезнь"))
+    # что за заклинание -> какой аффект: снимаем по строке каста, не дожидаясь столбца в таблице
+    DEBUFF_SPELLS = (("слепот", "слеп"), ("молчани", "молч"), ("безмолв", "молч"),
+                     ("придержать", "холд"), ("сков", "холд"), ("обездвиж", "холд"),
+                     ("окамен", "камен"), ("камен", "камен"), ("проклят", "прокл"),
+                     ("забвени", "забв"), ("болезн", "болезнь"), ("отрав", "яд"),
+                     ("украсть душу", "укр"), ("похитить душу", "укр"))
+
+    def surge_left(self):
+        """Остаток прилива сил по таблице «пгр прил.сил»: 0 — ни у кого нет (можно садиться)."""
+        self.send_raw("пгр прил.сил")
+        time.sleep(1.2)
+        best = 0
+        for m in (self.group or {}).get("members", []):
+            v = ""
+            for k in ("ПрСил", "ПрилСил", "Прилив"):
+                v = (m["cols"].get(k) or "").strip()
+                if v:
+                    break
+            mm = re.match(r"(\d+):(\d{2})", v)
+            if mm:
+                best = max(best, int(mm.group(1)) * 60 + int(mm.group(2)))
+            elif v and v not in ("Н", "-", "0:00"):
+                best = max(best, 1)
+        return best
+
+    def do_rest(self, announce=False, minsec=0):
+        """«рас»: оба перса отд → расс → ждём HP → вст. announce — позвать напарника группой.
+        minsec — минимальное время в «расс» (прилив сил набирается не мгновенно)."""
+        if getattr(self, "resting", False) or time.time() < getattr(self, "rest_done_t", 0):
+            return                                       # не отдыхаем дважды подряд (иначе таймеры прилива разъезжаются)
+        left = self.surge_left()
+        if left:                                         # прилив ещё висит (кд общий, длительность разная) — не садимся
+            self.emit("sys", "рас: прилив сил ещё %d:%02d — не сажусь" % (left // 60, left % 60))
+            self.rest_done_t = time.time() + 30
+            return
+        self.resting = True
+        try:
+            if announce and NAME.lower() == "тадия":
+                self.send_cmd("гг !рас")                 # Зорон по фк тоже сядет отдыхать
+            self.send_raw("отд")
+            time.sleep(0.6)
+            self.send_raw("расслаб")                     # только прилив сил; хиты лечим перевязкой
+            time.sleep(0.6)
+            self.send_raw("вст")
+            self.emit("sys", "рас: отд; расслаб; вст")
+        finally:
+            self.resting = False
+            self.rest_done_t = time.time() + 30
+
+    def group_debuffs(self):
+        """Есть ли дебафф у кого-то из группы (только столбцы таблицы + слепота): пока есть — землетряс не кастуем."""
+        if not AFF_TRIGGERS:
+            return False                                  # дебаффы больше не снимаем — и землетряс не блокируем
+        for m in (self.group or {}).get("members", []):
+            for col, kind in self.DEBUFF_COLS:
+                if self.aff_ok(kind) and self.aff_on(m["cols"].get(col)):
+                    return True
+        return self.is_blind()
+
+    def bandage_check(self):
+        """Перевязка по вашим правилам: Тадия — себе (молчание или <40% ХП), Зорону только если молчат оба;
+        Зорон — Тадии (поднять ХП или снять молчание)."""
+        now = time.time()
+        if now < getattr(self, "bandage_t", 0):
+            return
+        st = self.st or {}
+        low = st.get("hpm") and st.get("hp", 0) < st["hpm"] * 0.40
+        mine_mute = self.aff_ok("молч") and bool((getattr(self, "self_aff") or {}).get("Молч"))
+        partner = "зорон" if (NAME or "").lower() == "тадия" else "тадия"
+        p_mute = p_bar = None
+        for m in (self.group or {}).get("members", []):
+            nm = re.sub(r"^\d+\*?\s*", "", m["name"]).replace("*", "").strip().lower()
+            if nm == partner:
+                p_mute = self.aff_on(m["cols"].get("Молч"))
+                p_bar = m["cols"].get("H")
+                break
+        if (NAME or "").lower() == "тадия":
+            if mine_mute and p_mute:
+                self.bandage_t = now + 15
+                self.send_raw("перевязка " + partner)     # молчат оба — перевязываю Зорона
+                self.emit("sys", "перевязка: молчим оба — на Зорона")
+            elif mine_mute or low:
+                self.bandage_t = now + 15
+                self.send_raw("перевязка")                # себе: молчание или мало хитов
+                self.emit("sys", "перевязка: %s — на себя" % ("молчание" if mine_mute else "хп %d/%d" % (st.get("hp"), st.get("hpm"))))
+        else:
+            # Зорон лечит Тадию перевязкой: поднять ХП или когда сам в молчании
+            if mine_mute or (isinstance(p_bar, int) and p_bar <= 2):
+                self.bandage_t = now + 15
+                self.send_raw("перевязка " + partner)
+                self.emit("sys", "перевязка: Тадия — %s" % ("я в молчании" if mine_mute else "%d/5 хитов" % p_bar))
 
     def send_cmd(self, c):
         """Команда из алиаса/триггера: слова ЧЕК делает клиент, остальное уходит в игру."""
         w = c.strip().lower()
+        if w.startswith("ждать"):                       # «ждать 75» из #act/маршрута — пауза, не команда в игру
+            try:
+                time.sleep(min(5.0, float(w.split()[1]) / 10.0))
+            except (IndexError, ValueError):
+                pass
+            return
+        if w in ("рас", "расс", "#рас"):               # отдых + расслабиться, ждём HP, встаём
+            threading.Thread(target=self.do_rest, daemon=True).start()
+            return
+        if w in ("стоп", "stop"):                       # остановить бота, шаг запомнить
+            self.bot_stop()
+            return
+        if w == "старт" or w.startswith("старт "):      # продолжить с запомненного шага
+            self.bot_start(c.strip()[5:].strip())
+            return
+        if w == "сумм":                                 # алиас из триггера/профиля: призыв всех, у кого «Рядом: Н»
+            self.summon_far()
+            return
+        if w == "ремонт":                               # из триггера/профиля: «путь ремонт» -> «гг !чин все»
+            self.repair_run("из триггера", force=True)
+            return
         if w == "окей":
             self.chek("окей")
         elif NAME.lower() in self.DRUID and w.split(" ")[0] in ("поли", "морф") and " " in w:
@@ -1551,13 +2935,39 @@ class Mud:
         elif w.split(" ")[0] == "реск":                 # реск 2 3 — автоспас номеров каждый раунд; реск — выключить
             r = " ".join(w.split()[1:])
             self.rescue_set("" if r in ("0", "выкл") else r)
+        elif w.startswith("обл соз") or w.startswith("обл с "):
+            self.created_area = self.partner_in_group()
+            self.send_raw(c)
         elif w in self.CHEK_WORDS:                      # по очереди, в порядке команд
             if getattr(self, "chek_jobs", None) is None:
                 self.chek_jobs = queue.Queue()
                 threading.Thread(target=self.chek_worker, daemon=True).start()
             self.chek_jobs.put(w)
+        elif w.startswith("след ") or w == "след":      # запоминаем, за кем идём: после страха «след» рвётся
+            self.follow_who = c.strip()[5:].strip()
+            try:
+                with open(os.path.join(HERE, f"след_{NAME}.txt"), "w", encoding="utf-8") as f:
+                    f.write(self.follow_who)
+            except OSError:
+                pass
+            self.send_raw(c)
         else:
             self.send_raw(c)
+
+    def refollow(self):
+        """«Вы прекратили следовать» (страх, смерть, сбитая строка) — снова идём за тем, за кем шли."""
+        who = getattr(self, "follow_who", "") or ""
+        if not who:
+            try:
+                who = open(os.path.join(HERE, f"след_{NAME}.txt"), encoding="utf-8").read().strip()
+            except OSError:
+                who = ""
+        if not who or not self.partner_in_group():
+            return
+        self.follow_who = who
+        self.send_raw("след " + who)
+        self.emit("sys", "след сбился — снова следую за " + who)
+
     # ---------- друид (Тадия): полиморф по целям лидера, землетрясение -> живые корни ----------
     DRUID = ("тадия",)
     CD_FALLBACK = {"корни": 30, "поли": 300}           # кд (с): корни 30 с, полиморф 5 мин; сообщение «Вы вновь можете…» сбрасывает раньше
@@ -1659,6 +3069,539 @@ class Mud:
         self.send_raw("к полим " + t)
         self.chek_say("полиморф: к полим " + t)
 
+    def bot_state(self):
+        if not hasattr(self, "bot"):
+            self.bot = {"zone": "", "i": 0, "run": False, "state": "idle"}
+            try:
+                with open(os.path.join(HERE, f"бот_{NAME}.json"), encoding="utf-8") as f:
+                    d = json.load(f)
+                if isinstance(d, dict):
+                    self.bot.update({k: d[k] for k in ("zone", "i", "state", "zones") if k in d})
+            except Exception:
+                pass
+        return self.bot
+
+    def bot_save(self):
+        st = self.bot_state()
+        try:
+            with open(os.path.join(HERE, f"бот_{NAME}.json"), "w", encoding="utf-8") as f:
+                json.dump({"zone": st.get("zone", ""), "i": st.get("i", 0), "state": st.get("state", "idle"),
+                           "zones": int(st.get("zones") or 0)}, f, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def repair_run(self, why="вручную", force=False):
+        """Починка: состояния из «экип» -> «путь ремонт» -> дошли -> «гг !чин все» (каждый чинит себя)."""
+        if self.state != "game" or getattr(self, "repair_busy", False):
+            self.emit("sys", "ремонт: сейчас нельзя (не в игре или уже иду)")
+            return False
+        rows = [] if force else self.equip_state()
+        bad = [(s, n, c) for s, n, c in rows if "плохое" in c.lower() or "слом" in c.lower()]
+        if not force and rows and not bad:
+            self.emit("sys", "ремонт (%s): вещи в порядке — чинить нечего" % why)
+            return False
+        self.repair_busy = True
+        if bad:
+            self.emit("sys", "ремонт (%s): прочитал %d вещей, чинить %d — %s"
+                      % (why, len(rows), len(bad), ", ".join(n for _, n, _ in bad[:4])))
+        elif not rows:
+            self.emit("sys", "ремонт (%s): иду чинить (состояния не читал)" % why)
+        else:
+            self.emit("sys", "ремонт (%s): плановая починка" % why)
+        self.emit("sys", "ремонт (%s): «путь ремонт»" % why)
+
+        def go():
+            try:
+                self.repair_wait = time.time()            # ждём «Вы достигли пункта назначения.»
+                self.repair_arrived = self.repair_sent = 0
+                self.send_raw("путь ремонт")
+                shop = re.compile(r"кузн|ремонт|почин|оружей|кузнец", re.I)
+                t0 = time.time()
+                while time.time() - t0 < 45 and self.state == "game":
+                    if getattr(self, "repair_arrived", 0) or shop.search((self.cur or {}).get("name", "")):
+                        break
+                    time.sleep(1)
+                if not getattr(self, "repair_sent", 0):   # строка «дошли» не пришла — кричим отсюда
+                    self.repair_sent = time.time()
+                    self.send_raw("гг !чин все")
+                    self.emit("sys", "ремонт: «гг !чин все» (клетка «%s»)" % (self.cur or {}).get("name", "?"))
+                if not self.partner_in_group():           # напарника нет в группе — чиним себя сами
+                    self.send_raw("чинить все")
+                    self.emit("sys", "ремонт: напарника нет в группе — чиню себя сам")
+                time.sleep(1.5)
+            finally:
+                self.repair_wait = 0
+                self.repair_busy = False
+
+        threading.Thread(target=go, daemon=True).start()
+        return True
+
+    def bot_say(self, s):
+        self.emit("sys", "БОТ: " + s)
+
+    def bot_steps(self, zone):
+        info = BOT_ROUTES.get(zone)
+        if not info:
+            return None
+        p = os.path.join(BOT_DIR, info["file"])
+        try:
+            data = open(p, "rb").read()
+        except OSError:
+            return None
+        try:
+            t = data.decode("utf-8")
+        except UnicodeDecodeError:
+            t = data.decode("cp1251", "replace")
+        return [x.strip() for x in t.splitlines() if x.strip()]
+
+    def bot_start(self, arg=""):
+        st = self.bot_state()
+        zone = (arg or "").strip().lower().replace("амон сул", "амон") or st.get("zone") or "амон"
+        if zone not in BOT_ROUTES:
+            self.bot_say("не знаю зону «%s» (есть: %s)" % (zone, ", ".join(BOT_ROUTES)))
+            return
+        if (arg or "").strip() or st.get("zone") != zone:   # «старт <зона>» — всегда с начала
+            st["i"] = 0
+        steps = self.bot_steps(zone)
+        if not steps:
+            self.bot_say("не нашёл маршрут " + BOT_ROUTES[zone]["file"])
+            return
+        st.update(zone=zone, run=True, state="running")
+        self.run_start_t = time.time()
+        self.bot["steps"] = steps
+        self.bot_save()
+        self.bot_say("старт «%s» с шага %d из %d" % (zone, st.get("i", 0) + 1, len(steps)))
+        if not (getattr(self, "bot_thread", None) and self.bot_thread.is_alive()):
+            self.bot_thread = threading.Thread(target=self.bot_loop, daemon=True)
+            self.bot_thread.start()
+
+    def bot_stop(self):
+        st = self.bot_state()
+        st["run"] = False
+        st["state"] = "paused"
+        self.bot_save()
+        self.bot_say("стоп на шаге %d — запомнил, «старт» продолжит отсюда" % (st.get("i", 0) + 1))
+
+    def bot_loop(self):
+        st = self.bot_state()
+        try:
+            steps = self.bot.get("steps") or self.bot_steps(st.get("zone", ""))
+            if not steps:
+                self.bot_say("маршрут не загружен")
+                return
+            self.bot["steps"] = steps
+            v = (self.cur or {}).get("vnum", "")
+            if st.get("i", 0) == 0:
+                area0 = (self.cur or {}).get("area", "")
+                if area0 in ZONE_AREAS and self.obl_recent(st.get("zone", "")):
+                    i0 = self.bot_start_index(steps, v)     # зона не доделана, а область ещё висит — идём по текущей
+                    if i0:
+                        st["i"] = i0
+                        self.bot_save()
+                        self.bot_say("область ещё висит — продолжаю в ней с шага %d" % (i0 + 1))
+                if st.get("i", 0) == 0:
+                    if not self.bot_prelude(st):
+                        return
+                    info = BOT_ROUTES[st["zone"]]
+                    st["i"] = info.get("step", self.bot_start_index(steps, info["start"]))
+                    self.bot_save()
+            while st.get("run") and st["i"] < len(steps):
+                self.bot_do(steps[st["i"]], st)
+                if not st.get("run"):
+                    break
+                if st.get("jump") is not None:            # маршрут прыгает через #scr seekstep = N
+                    st["i"] = int(st.pop("jump"))
+                else:
+                    st["i"] += 1
+                self.bot_save()
+            if st["i"] >= len(steps) and st.get("run"):
+                st.update(run=False, state="done")
+                st["zones"] = int(st.get("zones") or 0) + 1
+                self.bot_save()
+                if st["zones"] % 3 == 0:                  # плановая починка после 3 зон — без проверки
+                    why, force = "3 зоны", True
+                else:
+                    bad = self.equip_bad()                # состояния вещей — из «экип», без осмотров
+                    why, force = ("по необходимости", False) if bad else ("", False)
+                    if bad:
+                        self.emit("sys", "вещи требуют починки: " + ", ".join(n for _, n, _ in bad[:5]))
+                self.bot_say("маршрут пройден (зон без починки: %d)%s" % (st["zones"], " — чинить" if why else ""))
+                if why:
+                    area = (self.cur or {}).get("area", "")
+                    if re.search(r"город|ривенделл|элендор|геолант|огис|фелонад|стэдвик", area, re.I):
+                        self.repair_run(why, force=force)
+                    else:
+                        self.emit("sys", "%s — пора чинить: «путь ремонт; чинить все» (сейчас «%s»)" % (why, area or "?"))
+        except Exception as e:
+            st["run"] = False
+            st["state"] = "error"
+            self.bot_save()
+            self.bot_say("сбой: %r" % (e,))
+
+    def bot_start_index(self, steps, vnum):
+        for i, s in enumerate(steps):
+            if ("==%s}" % vnum) in s.replace(" ", ""):
+                return i
+        return 0
+
+    def obl_active(self, zone_name):
+        """«обл»: активный экземпляр зоны (пока висит, новый не создать). Возвращает строку таблицы или ''."""
+        if not zone_name:
+            return ""
+        for ln in self.chek_cmd("обл", quiet=1.0):
+            low = ln.lower()
+            if "активен" in low and zone_name.lower() in low:
+                return ln.strip()
+        return ""
+
+    def obl_file(self, zone):
+        return os.path.join(HERE, "область_%s.txt" % (zone or "зона"))
+
+    def obl_recent(self, zone):
+        """Когда создавали область: кд 60 минут + минута. Пока она висит — новую не создать."""
+        try:
+            with open(self.obl_file(zone), encoding="utf-8") as f:
+                t = float(f.read().strip())
+        except (OSError, ValueError):
+            return 0
+        return t if time.time() - t < 61 * 60 else 0
+
+    def obl_save(self, zone):
+        try:
+            with open(self.obl_file(zone), "w", encoding="utf-8") as f:
+                f.write("%d" % time.time())
+        except OSError:
+            pass
+        self.bot_say("запомнил: область создана в %s, следующая не раньше %s"
+                     % (time.strftime("%H:%M"), time.strftime("%H:%M", time.localtime(time.time() + 61 * 60))))
+
+    def bot_prelude(self, st):
+        """Довести до входа в зону: аватара -> Ривенделл -> спидволк. Без этого маршрут начинается в Артуанели."""
+        start = BOT_ROUTES[st["zone"]]["start"]
+        v = (self.cur or {}).get("vnum", "")
+        if NAME.lower() == "тадия" and not str(v).startswith(("5", "9")) and not getattr(self, "regen_pre", False):
+            self.regen_pre = True                        # перед запуском, на складе: первый каст регенерации
+            self.send_raw("к реген тадия")
+            self.emit("sys", "регенерация: первый каст на Тадию (склад)")
+        name = ((self.cur or {}).get("name") or "")
+        area = ((self.cur or {}).get("area") or "")
+        if (v != start and v != "500001" and not str(v).startswith("9")
+                and area not in ("Гален", "Город Геолант")):
+            self.bot_say("возврат словом возврата из «%s»" % area)   # из зоны/города — в Гален
+            self.send_cmd("колд сл.возв")
+            time.sleep(5.0)
+            v = (self.cur or {}).get("vnum", "")
+            name = ((self.cur or {}).get("name") or "")
+            area = ((self.cur or {}).get("area") or "")
+        if not getattr(self, "staff_on", False):
+            self.staff_on = True                         # перед зоной следим за магическим посохом (заряжай)
+        self.keep_group(st, limit=25)                     # словом возврата улетела только я — напарника зовём
+        if v != start and v != "500001" and "Портал в Ривенделл" not in name and v != "90053":
+            if not str(v).startswith("9"):              # уже в аватаре — спидволк не нужен
+                p = find_path(v, "450842")              # спидволк до «Портал в пустоту» (аватара)
+                if p:
+                    self.bot_say("спидволк до аватары: %s" % "".join(p))
+                    self.send_raw(";".join(DIRW.get(d, d) for d in p))   # вне зоны — одной пачкой, а не по клетке
+                    end = time.time() + 10
+                    while time.time() < end and (self.cur or {}).get("vnum") != "450842":
+                        time.sleep(0.5)
+                    self.bot_say("вхожу в портал аватары")
+                    self.send_cmd("войти")
+                    end = time.time() + 8
+                    while time.time() < end and not str((self.cur or {}).get("vnum", "")).startswith("9"):
+                        time.sleep(0.5)
+                else:
+                    self.bot_say("к аватаре: путь ава")
+                    self.send_cmd("путь ава")
+                    end = time.time() + 15
+                    while time.time() < end and not str((self.cur or {}).get("vnum", "")).startswith("9") \
+                            and (self.cur or {}).get("vnum") != "500001":
+                        time.sleep(0.5)
+            self.bot_say("куп 2 → ждать 2 → 2")
+            self.send_cmd("куп 2")
+            time.sleep(2.0)
+            self.send_cmd("2")
+            time.sleep(1.0)
+            self.bot_say("путь ривен (болванка вместо пачки — дай пачку, впишу)")
+            self.send_cmd("путь ривен")
+            end = time.time() + 25
+            while time.time() < end and "Портал в Ривенделл" not in ((self.cur or {}).get("name") or "") \
+                    and (self.cur or {}).get("vnum") not in ("90053", "500001"):
+                time.sleep(0.5)
+        if (self.cur or {}).get("vnum") != "500001":
+            self.bot_say("в портал: войти портал")
+            self.bot_send("войти портал")
+            end = time.time() + 6
+            while time.time() < end and (self.cur or {}).get("vnum") != "500001":
+                time.sleep(0.5)
+            if (self.cur or {}).get("vnum") != "500001":
+                self.bot_send("войти")
+                time.sleep(2.0)
+        if (self.cur or {}).get("vnum") == "500001":
+            walk = expand_walk(BOT_WALK.get(st["zone"], ""))
+            self.send_raw(";".join(walk))                # спидволк от портала аватары до входа в зону — одной пачкой
+            end = time.time() + 25
+            while time.time() < end and (self.cur or {}).get("vnum") != start and st.get("run"):
+                time.sleep(0.5)
+        if (self.cur or {}).get("vnum") != start:
+            self.bot_say("не доехал до %s, стою в %s — правь и «старт»" % (start, (self.cur or {}).get("vnum")))
+            st["run"] = False
+            self.bot_save()
+            return False
+        create = BOT_ROUTES[st["zone"]].get("create")
+        active = self.obl_active(BOT_ROUTES[st["zone"]].get("zone_name", "")) if create else ""
+        if create and active:
+            self.bot_say("экземпляр зоны уже активен (%s) — новый не создаю, доходим текущий" % active[:70])
+            create = None
+        recent = self.obl_recent(st["zone"])
+        if create and recent:
+            self.bot_say("область создана в %s — новую не создаю до %s, доходим текущую"
+                         % (time.strftime("%H:%M", time.localtime(recent)),
+                            time.strftime("%H:%M", time.localtime(recent + 61 * 60))))
+            create = None
+        if create:                                       # экземпляр зоны: без него маршрут идёт по обычной зоне
+            self.created_area = self.partner_in_group()  # создавали в группе — сможем призывать
+            if not getattr(self, "rest_zone", False):    # клетка ПЕРЕД зоной — садимся и берём прилив сил
+                self.rest_zone = True
+                self.bot_say("перед зоной: отд;расс (прилив сил, кд 12 мин)")
+                self.do_rest(announce=True, minsec=20)
+            pre = BOT_ROUTES[st["zone"]].get("pre")
+            if pre:
+                self.bot_say("перед созданием: " + pre)
+                self.send_cmd(pre)                     # не через bot_send: «реж» в списке пропускаемых
+                time.sleep(1.0)
+            self.bot_say("создаю область: " + create)
+            self.creating = True
+            self.send_cmd(create)                     # групповая строка: создаёт тот, у кого фк
+            time.sleep(2.0)
+        self.bot_say("на месте (%s), дальше маршрут" % start)
+        return True
+
+    SHARD_CELLS = ("504029", "504028", "504027", "504002")
+
+    def shards_now(self):
+        """Сколько древних осколков в инвентаре (по «инв»): счётчик в памяти теряется при перезапуске окна."""
+        n = 0
+        for l in self.chek_cmd("инв", quiet=1.0):
+            m = re.match(r"^\s*древние осколки(?:\s*\[(\d+)\])?\s*$", l.strip(), re.I)
+            if m:
+                n += int(m.group(1) or 1)
+        return n
+
+    def shard_wait(self, cell, st, secs=12):
+        """Клетка осколка: добить и обобрать трупы, пока осколок не в руках — иначе уйдём без него."""
+        if self.shards_now() >= 4:
+            return True
+        t0 = time.time()
+        said = False
+        while st.get("run") and time.time() - t0 < secs:
+            if cell in getattr(self, "shard_done", set()):
+                return True
+            if not said:
+                said = True
+                self.bot_say("клетка осколка %s — добиваю и обираю" % cell)
+            for c in ("взя все все.труп", "взя все"):
+                self.send_raw(c)
+                time.sleep(0.6)
+                if cell in getattr(self, "shard_done", set()):
+                    return True
+            if not self.hostile_mobs():
+                self.dark_fix()
+                self.send_raw("смотреть")
+                time.sleep(1.0)
+                self.send_raw("взя все все.труп")
+                time.sleep(0.6)
+            time.sleep(1.5)
+        self.bot_say("осколок в клетке %s не взялся — иду дальше" % cell)
+        return cell in getattr(self, "shard_done", set())
+
+    def bot_do(self, step, st):
+        import jmcprofile as jp
+        v0 = (self.cur or {}).get("vnum", "")
+        if v0 in self.SHARD_CELLS and v0 not in getattr(self, "shard_done", set()) \
+                and re.search(r"\b(север|юг|восток|запад|вверх|вниз)\b", step):
+            if self.shard_wait(v0, st) and getattr(self, "kill_n", 0):
+                self.send_raw("взя все все.труп")
+                time.sleep(0.3)
+                self.send_raw("взя все")
+                self.kill_n = 0
+        rest_at = BOT_ROUTES.get(st.get("zone", ""), {}).get("rest_at") or ()
+        if time.time() >= getattr(self, "bgr_t", 0):     # таблица группы каждые 2.5 с: её видит и окно напарника,
+            self.bgr_t = time.time() + 2.5                # поэтому он вовремя снимает слепоту/молчание
+            self.send_raw("гр")
+        if v0 in rest_at and time.time() >= getattr(self, "rest_done_t", 0) and not getattr(self, "resting", False):
+            self.bot_say("перед боссом: отд;расс (прилив сил)")
+            self.do_rest(announce=True, minsec=15)
+        # портал уже открыт (фигура приняла осколки): осколки не собираем, идём «войти»
+        has_portal = any("портал" in (x[0] or "").lower() for x in ((self.room or {}).get("items") or []))
+        if has_portal:
+            self.shards_given = True
+        # осколки проверяем ПЕРЕД тем, как их отдавать (в маршруте это шаг «дать оск фигу»),
+        # иначе после сдачи в инвентаре 0 и бот решает, что осколков нет
+        if "дать оск" in step.lower() and not self.shards_given and self.shards_now() < 4:
+            self.shards = self.shards_now()
+            self.bot_say("осколков %d из 4 — иду по клеткам осколков" % self.shards)
+            for cell in self.SHARD_CELLS:
+                if not st.get("run"):
+                    break
+                if self.bot_go_to(cell, st):
+                    self.clear_room(st)
+                    self.shard_wait(cell, st, 12)
+                self.shards = self.shards_now()
+                if self.shards >= 4:
+                    break
+            if self.shards < 4:
+                self.bot_say("осколков %d из 4 — на фигуру рано, стою" % self.shards)
+                st["run"] = False
+                st["state"] = "paused"
+                self.bot_save()
+                return
+            self.shards_given = False
+        if "дать оск" in step.lower():
+            self.shards_given = True                      # отдали — больше не пересчитываем на «войти»
+        if getattr(self, "kill_n", 0) and re.search(r"\b(север|юг|восток|запад|вверх|вниз)\b", step):
+            self.send_raw("взя все все.труп")             # лут перед выходом из клетки
+            time.sleep(0.4)
+            self.send_raw("взя все")
+            self.kill_n = 0
+        gave = False
+        for part in jp.split_cmds(step):
+            vnum = (self.cur or {}).get("vnum", "")
+            p = part.strip()
+            if not p:
+                continue
+            if p.startswith(".пауза"):
+                try:
+                    time.sleep(float(p.split()[1]) / 1000.0)
+                except (IndexError, ValueError):
+                    pass
+                continue
+            if p.startswith("#act"):
+                # тела #act из маршрута ТОЛСТОГО (ждать/вст/сменить $pWeapon) в клиенте не исполняем:
+                # берём оттуда только клетки, пути и .триг (двери, «дать сердце»), бой ведём своим кодом
+                continue
+            if p.startswith(".триг"):
+                rest = p[5:].strip()                     # «.триг откр мраморн.врат» — это команда, а не маркер
+                if rest and re.match(r"^(откр|отпер|запер|дать|взя|брос|пну)", rest, re.I):
+                    for c in jp.split_cmds(rest):
+                        c = c.strip()
+                        if c.lower().startswith("откр "):   # заперто: сначала «отпер …», потом «откр …»
+                            self.bot_send("отпер " + c[5:])
+                        self.bot_send(c)
+                continue
+            if p.startswith(".") or p.startswith(("#var", "#scr", "#stat", "#group", "#loopback")):
+                continue
+            if p.startswith("#if"):
+                m = re.match(r"#if \{\$MsdpRoomVnum\s*(!=|==)\s*(\d+)\}\s*\{(.*)\}$", p)
+                if not m:
+                    continue
+                op, n, body = m.group(1), m.group(2), m.group(3)
+                if (vnum == n) if op == "==" else (vnum != n):
+                    for c in jp.split_cmds(body):
+                        c = c.strip()
+                        if not c:
+                            continue
+                        vnum = (self.cur or {}).get("vnum", "")
+                        if c == "ПоискКлетки":
+                            self.bot_go_to(n, st)
+                            continue
+                        if c.startswith("#scr"):
+                            m_ss = re.search(r"seekstep\s*=\s*(\d+)", c)
+                            if m_ss:
+                                st["jump"] = int(m_ss.group(1))
+                            continue
+                        if vnum == "504015" and c.lower().startswith("войти") and not gave:
+                            self.bot_send("дать все.древ.оско фигу")
+                            time.sleep(1.5)
+                            gave = True
+                        self.bot_send(c)
+                continue
+            if vnum == "504015" and p.lower().startswith("войти") and not gave:
+                self.bot_send("дать все.древ.оско фигу")
+                time.sleep(1.5)
+                gave = True
+            self.bot_send(p)
+        moved = bool(re.search(r"\b(север|юг|восток|запад|вверх|вниз|войти|подкр)\b", step))
+        self.clear_room(st, moved)
+
+    def bot_send(self, c):
+        low = c.strip().lower()
+        if low == "перебраться":                        # через трещину идут группой: сначала «гг !перебраться»
+            self.send_cmd("гг !перебраться")
+            self.send_cmd("перебраться")
+            return
+        skip = {"реж", "аф", "сис", "сня", "куп", "пну", "пнуть", "mkill", "мkill", "look",
+                "заряжай", "ботодеться", "бгр", "стат", "#stat"}
+        if low.split(" ")[0] in skip:                   # из маршрута нужен только путь и квестовые действия
+            return
+        if low.startswith("ждать"):                     # «ждать 40» из маршрута — пауза (в десятых секунды)
+            try:
+                time.sleep(min(5.0, float(low.split()[1]) / 10.0))
+            except (IndexError, ValueError):
+                pass
+            return
+        if low.startswith("подкр "):                    # «подкр север» — это подкрасться+идти; идём просто на север
+            c = c.strip()[6:].strip()
+            low = c.lower()
+        if WALK_RE.match(low):                          # «2ws3w» — спидволк: одной пачкой через «;»
+            dirs = [DIRW.get(d, d) for d in expand_walk(low)]
+            self.send_raw(";".join(dirs))
+            return
+        if low == "бгр":
+            c = "пгр боле здоро ряд пози холд молч слеп яд ук.ду"
+        elif low == "заряжай":
+            c = "клич копье древней династии"
+        self.send_cmd(c)
+
+    def bot_go_to(self, n, st):
+        if (self.cur or {}).get("vnum") == n:
+            return True
+        path = find_path((self.cur or {}).get("vnum", ""), n)
+        if not path and (self.cur or {}).get("area", "") not in ZONE_AREAS:
+            # выбросило из зоны (реж трус / рекол / смерть): лечим хиты, возвращаемся к входу, идём дальше
+            self.bot_say("не в зоне (%s) — возвращаюсь к входу и продолжу" % (self.cur or {}).get("name"))
+            t_hp = time.time()
+            while (self.st or {}).get("hp", 0) < (self.st or {}).get("hpm", 1) * 0.7 \
+                    and time.time() - t_hp < 45 and st.get("run"):
+                time.sleep(2.0)                            # хиты лечит перевязка (Зорон), не отдых
+            if self.bot_prelude(st):
+                path = find_path((self.cur or {}).get("vnum", ""), n)
+        if not path:
+            self.bot_say("нет пути %s → %s, стоп" % ((self.cur or {}).get("vnum"), n))
+            st["run"] = False
+            st["state"] = "stopped"
+            self.bot_save()
+            return False
+        dirs = [DIRW.get(d, d) for d in path]
+        if (self.cur or {}).get("area", "") in ZONE_AREAS:   # в зоне спидволк не работает (агро) — идём по клетке
+            for d in dirs:
+                self.send_raw(d)
+                time.sleep(0.45)
+        else:
+            self.send_raw(";".join(dirs))                    # вне зоны — пачкой
+        end = time.time() + 10
+        while time.time() < end and (self.cur or {}).get("vnum") != n and st.get("run"):
+            time.sleep(0.1)
+        return (self.cur or {}).get("vnum") == n
+
+    @staticmethod
+    def bot_walk(dirs):
+        m = {"N": "n", "S": "s", "E": "e", "W": "w", "U": "u", "D": "d"}
+        out, prev, cnt = [], "", 0
+        for d in dirs:
+            ch = m.get(d)
+            if not ch:
+                continue
+            if ch == prev:
+                cnt += 1
+            else:
+                if prev:
+                    out.append((str(cnt) if cnt > 1 else "") + prev)
+                prev, cnt = ch, 1
+        if prev:
+            out.append((str(cnt) if cnt > 1 else "") + prev)
+        return "".join(out)
+
     def rescue_set(self, r):
         """Включить/выключить автореск; список номеров запоминается в реск_<имя>.txt и поднимается после перезапуска клиента."""
         self.rescue = r
@@ -1678,6 +3621,8 @@ class Mud:
         # не больше одной нашей команды: следующую шлём только когда пришёл ответ на предыдущую (при задержке — пропускаем раунд).
         done = re.compile(r"Но никто не сражается|^(Вы|%s)\b.*спас|Вы не можете|Вы не видите здесь|Вы уже" % NAME, re.I)
         done_any = re.compile(r"^Вы |Кому именно|Но никто|не можете", re.I)
+        if self.is_blind():
+            return                                        # слепой не рескает: сначала «слово света» (cure_first)
 
         def cmd(c, pat=done, wait=4.0):
             q = self.res_q = queue.Queue()
@@ -1697,9 +3642,7 @@ class Mud:
             return
         if re.search(r"^(Вы|%s)\b.*спас" % NAME, r, re.I):
             return                                      # спасли (или пытались)
-        if cmd("пом", done_any) is None:                        # по списку рескать некого («Но никто не сражается с …») -> пом; яр х
-            return
-        if time.time() - getattr(self, "yar_t", 0) >= 10:           # яр х — не чаще раза в 5 раундов (~10 с)
+        if time.time() - getattr(self, "yar_t", 0) >= 10:      # яр х — раз в 5 раундов
             self.yar_t = time.time()
             cmd("яр х", done_any)
 
@@ -1736,7 +3679,35 @@ class Mud:
 
     def chek_read_eq(self):
         rx = re.compile(r"^\s*<([^>]+)>\s+(.+?)(?:\s*\[[^\]]*\])?(?:\s*\.\.\..*)?\s*$")
-        return ["<" + m.group(1).strip() + "> " + m.group(2).strip() for m in map(rx.match, self.chek_cmd("экип")) if m]
+        lines = self.chek_cmd("экип")
+        self.equip_cond = equip_items(lines)             # слот/вещь/состояние — из «экип», состояние в [..]
+        self.equip_t = time.time()
+        return ["<" + m.group(1).strip() + "> " + m.group(2).strip() for m in map(rx.match, lines) if m]
+
+    def equip_state(self):
+        """Надетое с состоянием: [(слот, вещь, состояние)] — из «экип» (состояние в скобках)."""
+        if getattr(self, "chek_q", None):
+            return []
+        return equip_items(self.chek_cmd("экип"))
+
+    def equip_bad(self):
+        """Вещи, которые пора чинить: состояние «плохое», «очень плохое» или «сломано»."""
+        rows = getattr(self, "equip_cond", None)
+        if not rows or time.time() - getattr(self, "equip_t", 0) > 30:
+            rows = self.equip_state()
+        return [(s, n, c) for s, n, c in rows if "плохое" in c.lower() or "слом" in c.lower()]
+
+    def state_report(self):
+        """Состояние экипировки в окно «Проверки» (из «экип», без осмотров)."""
+        def go():
+            rows = self.equip_state()
+            bad = [(s, n, c) for s, n, c in rows if "плохое" in c.lower() or "слом" in c.lower()]
+            self.chek_say("экипировка: вещей %d, чинить %d" % (len(rows), len(bad)))
+            for s, n, c in bad:
+                self.chek_say("ЧИНИТЬ: <%s> %s — %s" % (s, n, c))
+            if rows and not bad:
+                self.chek_say("состояние: всё в порядке, чинить нечего")
+        threading.Thread(target=go, daemon=True).start()
 
     def chek_diff(self, saved, rows):
         # парные вещи (запястья, пальцы, руки) надеваются на любую сторону: «левой/правой» в слоте при сверке не считаем
@@ -1751,7 +3722,7 @@ class Mud:
 
     def chek_saved(self):
         try:
-            with open(os.path.join(HERE, f"экип_{NAME}.txt"), encoding="utf-8") as f:
+            with open(os.path.join(HERE, f"экип_{NAME}.txt"), encoding="utf-8", errors="replace") as f:
                 return [x.strip() for x in f if x.strip()]
         except OSError:
             return None
@@ -1760,6 +3731,8 @@ class Mud:
         rows = self.chek_read_eq()
         if not rows:
             return self.chek_say("экипировка не прочитана (ничего не надето?) — запомненное не трогаю")
+        for s, n, c in self.equip_bad():
+            self.chek_say("ЧИНИТЬ: <%s> %s — %s" % (s, n, c))   # состояние из «экип»: плохое/очень плохое/сломано
         want = self.CHEK_EXPECT.get(NAME.lower())
         if want and len(rows) < want:
             self.chek_say(f"НАДЕТО {len(rows)} ИЗ {want}")
@@ -1799,10 +3772,12 @@ class Mud:
                     if any(w.startswith(key) for w in words):
                         have[key] = have.get(key, 0) + int(m.group(2) or 1)
         if not on:
-            return self.chek_say("инвентарь не прочитан (команда «инв»)")
+            self.chek_say("инвентарь не прочитан (команда «инв»)")
+            return {}
         for key, need, word in self.CHEK_ITEMS:
             total = have.get(key, 0)
             self.chek_say(f"{key}: {total} (нужно {need})" + (f"   МАЛО {word}" if total < need else ""))
+        return have
 
     def chek_do_unset(self, n):
         dept = self.profile.vars.get("СетОтдел")
@@ -1816,7 +3791,7 @@ class Mud:
 
     def chek_unset(self):
         if NAME.lower() in self.CHEK_LEADERS:
-            self.chek_group_verify()
+            CHEK_GROUP and self.chek_group_verify()
         time.sleep(1.5)
         rows, saved = self.chek_read_eq(), self.chek_saved()
         if not saved:
@@ -1853,7 +3828,8 @@ class Mud:
 
     def chek_group_ref(self, nm):
         try:
-            with open(os.path.join(HERE, f"экип_гр_{nm.lower()}.txt"), encoding="utf-8") as f:
+            # errors="replace": файл могли писать два окна сразу (Тадия и Зорон) — битый байт не должен ронять проверку
+            with open(os.path.join(HERE, f"экип_гр_{nm.lower()}.txt"), encoding="utf-8", errors="replace") as f:
                 return [x.strip() for x in f if x.strip()]
         except OSError:
             return None
@@ -1891,8 +3867,11 @@ class Mud:
             elif not miss:
                 self.chek_say(f"{nm}: надето {len(rows)}, всё на месте")
             if not miss or ref is None:                 # образец обновляем только полным комплектом
-                with open(os.path.join(HERE, f"экип_гр_{nm.lower()}.txt"), "w", encoding="utf-8") as f:
+                p = os.path.join(HERE, f"экип_гр_{nm.lower()}.txt")
+                tmp = p + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
                     f.write("\n".join(rows) + "\n")
+                os.replace(tmp, p)                      # атомарно: два окна (Тадия и Зорон) не перемешают байты
         self.send_raw("гг Проверка стафа закончена")
 
     def chek_group_verify(self):
@@ -1922,9 +3901,11 @@ class Mud:
             try:
                 self.chek(what)
             except Exception as e:
-                self.chek_say(f"сбой: {e!r}")
+                self.chek_say(f"сбой: {type(e).__name__}: {e}")      # без repr: байты в окно не сыплем
 
     def chek(self, what):
+        if what in ("сетгр", "стафгр") and not CHEK_GROUP:
+            return
         if what == "окей":
             n, self.chek_pending = getattr(self, "chek_pending", None), None
             return self.chek_do_unset(n) if n else self.chek_say("нечего подтверждать")
@@ -1963,7 +3944,9 @@ class Mud:
         if not cmds:
             return
         now = time.time()
-        self.trig_times = [t for t in getattr(self, "trig_times", []) if now - t < 10] + [now] * len(cmds)
+        # команда лидера в чате («Съезо сказал вам: "!очистить"») петлю не даёт — в лавину не считаем
+        chat = re.search(r'сказал\S* (?:вам|группе): "!', plain)
+        self.trig_times = [t for t in getattr(self, "trig_times", []) if now - t < 10] + ([] if chat else [now] * len(cmds))
         if len(self.trig_times) > 40:
             self.profile.enabled = False
             try:    # что именно вызвало лавину — в файл, чтобы разобрать
@@ -1978,16 +3961,19 @@ class Mud:
         for c in cmds:
             self.send_cmd(c)
 
+    def log_trace(self):
+        import traceback
+        try:
+            with open(os.path.join(HERE, f"ошибки_{NAME}.log"), "a", encoding="utf-8") as f:
+                f.write(time.strftime("%d.%m %H:%M:%S") + chr(10) + traceback.format_exc() + chr(10))
+        except Exception:
+            pass
+
     def safe_text(self, s):
         try:
             self.text(s)
         except Exception:
-            import traceback
-            try:
-                with open(os.path.join(HERE, f"ошибки_{NAME}.log"), "a", encoding="utf-8") as f:
-                    f.write(time.strftime("%d.%m %H:%M:%S") + chr(10) + traceback.format_exc() + chr(10))
-            except Exception:
-                pass
+            self.log_trace()
 
     def reader(self):
         mode, verb, sb = 0, 0, bytearray()
@@ -2105,7 +4091,7 @@ class H(BaseHTTPRequestHandler):
                     play(SOUND_HIZ)
                 self._send(200, "ok")
             elif u.path == "/api/info":
-                self._json({"name": NAME, "port": WEB_PORT, "autolook": MUD.autolook, "app": APP_NAME, "version": VERSION, "windows": len(MUD.subs),
+                self._json({"name": NAME, "port": WEB_PORT, "autolook": MUD.autolook, "hidemap": MUD.hide_map, "app": APP_NAME, "version": VERSION, "windows": len(MUD.subs),
                             "connected": MUD.connected})
             elif u.path == "/api/profiles":
                 self._json({"current": NAME, "list": profiles_list()})
@@ -2126,7 +4112,11 @@ class H(BaseHTTPRequestHandler):
                     MUD.disconnect()
                     threading.Timer(0.5, lambda: os._exit(0)).start()
             elif u.path == "/api/hidemap":
-                MUD.hide_map = q.get("on") == "1"
+                if "on" in q:                              # без параметра — только прочитать, не меняя
+                    was = MUD.hide_map
+                    MUD.hide_map = q.get("on") == "1"
+                    if was != MUD.hide_map:
+                        MUD.emit("sys", "карта «реж карт»: " + ("не в игре (в миникарте)" if MUD.hide_map else "показывается в окне игры"))
                 self._json({"hidemap": MUD.hide_map})
             elif u.path == "/api/autolook":
                 MUD.autolook = q.get("on") == "1"

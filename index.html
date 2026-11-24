@@ -158,7 +158,11 @@ const C=['#555','#d0544a','#3fae5a','#c9a227','#4a7be0','#b065c8','#2aa8b8','#c9
 let fg=null,bold=false;
 const MAXL=20000,live=$('live');
 let GRG=[],GRSHOW=0,GAGS=[],cur_ln=null,lastVis=null,lastPlain=null;
-const PROMPT_ONLY=/^\d+H \d+M \d+V \S+ \d+C Вых:\S*>+\s*$/;
+// строка состояния (приглашение) в бою: «14441H 17348M 3620V 69.6%X 58367201C Вых:СВЮЗ>»,
+// «… 58411208C [Тадия:О.Хорошее]-[Съезо:Великолепное] [скат:Великолепное] Вых:СЮ>>» — перед «Вых:» до трёх скобок
+const PR_BODY='\\d+H \\d+M \\d+V \\S+ \\d+C (?:\\[[^\\]]+\\][- ]+)*Вых:\\S*?>+';
+const PROMPT_ONLY=new RegExp('^[ \\t]*'+PR_BODY+'\\s*$');
+const PR_LINE=new RegExp('^[ \\t]*'+PR_BODY);
 function hhmmss(){const d=new Date();return d.toTimeString().slice(0,8)}
 function atBottom(){return out.scrollHeight-out.scrollTop-out.clientHeight<40}
 function newLine(){const d=document.createElement('div');d.className='ln';const t=document.createElement('span');t.className='ts';t.textContent=hhmmss();d.appendChild(t);out.appendChild(d);return d}
@@ -176,8 +180,9 @@ function finish(d){const p=body(d).replace(/\s+$/,'');if(/ R\.I\.P\.$/.test(p)&&
  if(cm&&!cm.skip){addChat(cm);if(!$('chgame').checked&&!$('w-chat').classList.contains('hid')){d.classList.add('g');return}}   // сообщение ушло в окно «Сообщения»
  if(gagged(p)){d.classList.add('g');return}
  const key=p.trim()===''?'':p;
+ // строка состояния: подряд идущие приглашения не копим, видно только последнее
+ if(PROMPT_ONLY.test(p)){if(lastVis&&PROMPT_ONLY.test(lastPlain||''))lastVis.classList.add('g');lastVis=d;lastPlain=key;return}
  if(lastVis&&key===lastPlain){d.classList.add('g');let r=lastVis.querySelector('.rep');if(!r){r=document.createElement('span');r.className='rep';r.dataset.n=1;lastVis.appendChild(r)}r.dataset.n=+r.dataset.n+1;r.textContent='×'+r.dataset.n;return}
- if(PROMPT_ONLY.test(p)&&lastVis&&PROMPT_ONLY.test(lastPlain||'')){lastVis.classList.add('g')}
  lastVis=d;lastPlain=key}
 function trimOut(){while(out.childElementCount>MAXL)out.removeChild(out.firstChild)}
 function showLive(){if(atBottom()){live.style.display='none';return}live.style.display='block';live.innerHTML='';
@@ -189,7 +194,7 @@ addEventListener('keydown',e=>{if(e.key!=='Escape')return;const t=e.target;
  if(t!==cmd&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'))return;          // в полях закладок Esc свой
  // первый Esc закрывает буфер прокрутки, второй (буфер уже закрыт) очищает строку ввода
  if(!atBottom()){out.scrollTop=out.scrollHeight;showLive()}
- else if(cmd.type!=='password'){cmd.value='';hp=hist.length}
+ else if(cmd.type!=='password'){cmd.value='';histReset()}
  cmd.focus()});
 // pointerup в фазе перехвата: срабатывает и после перетаскивания окон (там pointerdown гасит mouseup) и на карте
 addEventListener('pointerup',e=>{const t=e.target;if(!t.closest||t.closest('input,textarea,select,button,label,a,#optm,#tip,#pick,#npd,[data-close]'))return;
@@ -227,7 +232,21 @@ $('npo').onclick=async()=>{const name=$('npn').value.trim(),mode=document.queryS
  await pickProf(r.name)};
 loadProfiles();
 function ansi(text){const stick=atBottom(),re=/\x1b\[([0-9;]*)([A-Za-z])/g;text=text.replace(/\r/g,'');
- const put=s=>{const parts=s.split('\n');parts.forEach((seg,k)=>{if(k>0){finish(cur_ln);cur_ln=null}if(!cur_ln)cur_ln=newLine();if(seg)span(cur_ln,seg,null,col())})};
+ // игра присылает приглашение без перевода строки и может сразу писать дальше («…Вых:СВЮЗ>Предмет …»,
+ // «…Вых:СВЮЗ> 14441H … Вых:СВЮЗ>»), поэтому приглашение всегда заканчивает строку: всё, что после него, — с новой
+ const putSeg=seg=>{let rest=seg;
+  while(rest){
+   const cur=body(cur_ln),total=cur+rest,m=total.match(PR_LINE),tail=m?total.slice(m[0].length):'';
+   if(m&&!tail.trim()){                                 // строка целиком приглашение (или его конец)
+    if(lastVis&&lastVis!==cur_ln&&PROMPT_ONLY.test(lastPlain||''))lastVis.classList.add('g')   // подряд идущие: видно только последнее
+    span(cur_ln,rest,null,col());rest='';break}
+   if(m){                                               // приглашение, а следом уже идёт текст — разводим по строкам
+    if(m[0].length>cur.length)span(cur_ln,rest.slice(0,m[0].length-cur.length),null,col());
+    finish(cur_ln);cur_ln=newLine();
+    if(m[0].length>cur.length)rest=rest.slice(m[0].length-cur.length);
+    rest=rest.replace(/^[ \t]+(?=\d+H \d+M \d+V )/,'');continue}
+   span(cur_ln,rest,null,col());rest=''}};
+ const put=s=>{const parts=s.split('\n');parts.forEach((seg,k)=>{if(k>0){finish(cur_ln);cur_ln=null}if(!cur_ln)cur_ln=newLine();if(seg)putSeg(seg)})};
  let i=0,m;while((m=re.exec(text))){if(m.index>i)put(text.slice(i,m.index));if(m[2]==='m')sgr(m[1]||'0');i=re.lastIndex}
  if(i<text.length)put(text.slice(i));trimOut();if(stick)out.scrollTop=out.scrollHeight;else showLive()}
 function note(t,cls){const stick=atBottom();if(cur_ln&&!body(cur_ln).trim()){cur_ln.remove();cur_ln=null}
@@ -235,15 +254,40 @@ function note(t,cls){const stick=atBottom();if(cur_ln&&!body(cur_ln).trim()){cur
 $('sg').onchange=e=>{document.body.classList.toggle('showg',e.target.checked);showLive()};
 fetch('/api/gags').then(r=>r.json()).then(list=>{GAGS=GAGS.concat(list.map(s=>{try{return new RegExp(s)}catch(e){return null}}).filter(Boolean))});
 const hist=[];let hp=0,connected=false;
+// история ввода: ↑/↓ листают только команды, начинающиеся с уже набранного текста («пос» → «постой; 3; шник; 1»)
+let histQ='',histIdx=-1,histList=[];
+function histReset(){histIdx=-1;histQ='';histList=[]}
 // короткая запись в профиль: «алиас йц ,убить 2.», «триг Вы запищали ,прыг», «-алиас йц», «-триг Вы запищали»
 function shortProfile(v){let m=v.match(/^\s*(алиас|триг|триггер)\s+(.+?)\s*,(.+)$/i);
  if(m){const [_,k,a,b]=m;return (/^алиас/i.test(k)?'#alias':'#action')+' {'+a.trim()+'} {'+b.trim()+'}'}
  m=v.match(/^\s*-(алиас|триг|триггер)\s+(.+)$/i);if(m)return (/^алиас/i.test(m[1])?'#unalias':'#unaction')+' {'+m[2].trim()+'}';return null}
 $('f').onsubmit=e=>{e.preventDefault();const v=cmd.value;
- if(cmd.type==='password'){fetch('/password'+($('pwsv').checked?'?save=1':''),{method:'POST',body:v})}else{if(v){hist.push(v);hp=hist.length}if(/^\s*гр(у(п(п(а)?)?)?)?\s*$/i.test(v)){GRSHOW=Date.now()+2500;fetch('/grshow',{method:'POST'})}   // свою команду «группа» показываем в окне игры
+ if(cmd.type==='password'){fetch('/password'+($('pwsv').checked?'?save=1':''),{method:'POST',body:v})}else{if(v){hist.push(v);if(hist.length>500)hist.shift()}histReset();if(/^\s*гр(у(п(п(а)?)?)?)?\s*$/i.test(v)){GRSHOW=Date.now()+2500;fetch('/grshow',{method:'POST'})}   // свою команду «группа» показываем в окне игры
   const sp=shortProfile(v);if(sp)send(sp);else if(/^\s*#(alias|action|unalias|unaction|hot|unhot|variable|group)\b/i.test(v))send(v.trim());else v.trim()?sendCmds(v):send('')}cmd.value=''};
+cmd.oninput=()=>{if(histIdx>=0)histReset()};                 // правим набранное — поиск начинаем заново
 cmd.onkeydown=e=>{if(cmd.type==='password')return;
- if(e.key==='ArrowUp'&&hp>0){cmd.value=hist[--hp];e.preventDefault()}else if(e.key==='ArrowDown'){hp=Math.min(hist.length,hp+1);cmd.value=hist[hp]||'';e.preventDefault()}};
+ if(e.key!=='ArrowUp'&&e.key!=='ArrowDown')return;
+ e.preventDefault();
+ if(e.key==='ArrowUp'){
+  if(histIdx<0){histQ=cmd.value;histList=[];const q=histQ.toLowerCase();
+   for(let i=hist.length-1;i>=0;i--)if(hist[i].toLowerCase().startsWith(q))histList.push(hist[i]);histIdx=0}
+  else if(histIdx<histList.length-1)histIdx++;
+  if(histList.length)cmd.value=histList[histIdx]
+ }else{
+  if(histIdx<0)return;
+  if(histIdx>0){histIdx--;cmd.value=histList[histIdx]}
+  else{const q=histQ;histReset();cmd.value=q}
+ }};
+// Пейдж ап / Пейдж даун — буфер прокрутки окна игры: вверх открывает, вниз закрывает (как Esc)
+addEventListener('keydown',e=>{
+ if(e.key!=='PageUp'&&e.key!=='PageDown')return;
+ const t=e.target;
+ if(t&&(t.tagName==='SELECT'||t.tagName==='TEXTAREA'))return;
+ e.preventDefault();
+ const page=Math.max(80,Math.floor(out.clientHeight*0.85));
+ if(e.key==='PageUp')out.scrollTop=Math.max(0,out.scrollTop-page);
+ else out.scrollTop=Math.min(out.scrollHeight,out.scrollTop+page);
+ showLive()});
 function setStatus(on){connected=on;$('st').className=on?'on':'off';$('st').textContent=on?'sowmud.ru:5555':'нет связи';$('btn').textContent=on?'Отключиться':'Подключиться'}
 $('rst').onclick=async()=>{if(!confirm('Перезапустить клиент и войти в игру заново?'))return;note('Перезапуск…');
  await fetch('/api/restart',{method:'POST'}).catch(()=>{});await new Promise(r=>setTimeout(r,3000))
@@ -595,7 +639,7 @@ es.onmessage=async ev=>{const m=JSON.parse(ev.data),d=m.d;
  else if(m.t==='st')status(d);else if(m.t==='room')room(d);else if(m.t==='card')card(d);else if(m.t==='minimap')drawMini(d);
  else if(m.t==='mobs'){MAPMOBS=d;draw()}else if(m.t==='pos')pos(d);else if(m.t==='alert')alertMsg(d);else if(m.t==='check')checkMsg(d);else if(m.t==='autolook')$('al').checked=d;else if(m.t==='group'){GROUP=d;drawGroup()}else if(m.t==='profile'){loadProf()}else if(m.t==='trigs'){if(PROF)PROF.enabled=d;if(tab==='prof')render()}
  else if(m.t==='rooms'){clearTimeout(window._rt);window._rt=setTimeout(async()=>{if(Z&&cur&&Z.zone===cur.area){const keep=[ox,oy,sc,AL];await loadZone(Z.zone);[ox,oy,sc,AL]=keep;draw()}},1500)}
- else if(m.t==='init'){setStatus(d.status==='on');if(d.group){GROUP=d.group;drawGroup()}if(d.st&&d.st.hp!=null)status(d.st);if(d.room)room(d.room);if(d.card)card(d.card);if(d.minimap)drawMini(d.minimap);MAPMOBS=d.mobs||{};if(d.cur)pos({...d.cur,trail:d.trail})}};
+ else if(m.t==='init'){setStatus(d.status==='on');setHM();if(d.group){GROUP=d.group;drawGroup()}if(d.st&&d.st.hp!=null)status(d.st);if(d.room)room(d.room);if(d.card)card(d.card);if(d.minimap)drawMini(d.minimap);MAPMOBS=d.mobs||{};if(d.cur)pos({...d.cur,trail:d.trail})}};
 // после F5 страница не знает, что идёт запрос пароля — спросить у сервера и включить поле пароля
 function pwMode(on){cmd.type=on?'password':'text';cmd.classList.toggle('pw',on);cmd.placeholder=on?'пароль':'команда (; — несколько, ↑↓ — история)';if(on)cmd.focus()}
 setInterval(()=>j('/log?from=999999').then(d=>{if(d.state==='pass'&&cmd.type!=='password')pwMode(true);else if(d.state!=='pass'&&cmd.type==='password')pwMode(false)}).catch(()=>{}),1500);
